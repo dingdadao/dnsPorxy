@@ -113,6 +113,7 @@ type OptimizedDNSCache struct {
 	shardCount int
 	maxSize    int
 	defaultTTL atomic.Int64 // 兜底TTL（纳秒），支持热更新
+	staleTTL   atomic.Int64 // 过期宽限（纳秒），0=禁用 serve-stale；支持热更新
 	entryPool  *CacheEntryPool
 }
 
@@ -154,6 +155,16 @@ func (c *OptimizedDNSCache) defTTL() time.Duration {
 // SetDefaultTTL 热更新兜底TTL
 func (c *OptimizedDNSCache) SetDefaultTTL(ttl time.Duration) {
 	c.defaultTTL.Store(int64(ttl))
+}
+
+// SetStaleTTL 热更新过期宽限（0=禁用 serve-stale，过期即未命中）
+func (c *OptimizedDNSCache) SetStaleTTL(ttl time.Duration) {
+	c.staleTTL.Store(int64(ttl))
+}
+
+// staleGrace 返回当前过期宽限
+func (c *OptimizedDNSCache) staleGrace() time.Duration {
+	return time.Duration(c.staleTTL.Load())
 }
 
 // key 生成缓存键，scope 用于客户端分组隔离（未命中分组为 "-"）
@@ -511,14 +522,21 @@ func (c *OptimizedDNSCache) Get(scope, domain string, qType uint16) (*dns.Msg, b
 		entry.touchAt(now)
 
 		if now.After(expireAt) {
-			// 失败响应（如NXDOMAIN）过期后立即删除并返回未命中
+			// 已缓存的负响应（NXDOMAIN）过期后不再返回陈旧值，直接删除并按未命中回源
 			if !isCloud && rcode != dns.RcodeSuccess {
 				shard.mu.Lock()
 				delete(shard.store, key)
 				shard.mu.Unlock()
 				return nil, false, false, 0
 			}
-			// 成功的过期响应先返回客户端，懒惰删除避免缓存雪崩
+			// 超出过期宽限：删除条目并按未命中处理，由本次请求同步回源刷新（不做后台刷新）
+			if grace := c.staleGrace(); grace <= 0 || now.After(expireAt.Add(grace)) {
+				shard.mu.Lock()
+				delete(shard.store, key)
+				shard.mu.Unlock()
+				return nil, false, false, 0
+			}
+			// 宽限内：返回旧响应（TTL 压小），交由客户端稍后重查时同步回源
 			if isCloud && cloudResponse != nil {
 				resp := cloudResponse.Copy()
 				c.adjustExpiredResponseTTL(resp, 5*time.Second)
@@ -612,15 +630,21 @@ func (c *OptimizedDNSCache) GetWithFlight(scope, domain string, qType uint16) (*
 		entry.touchAt(now)
 
 		if now.After(expireAt) {
-			// 失败响应（如NXDOMAIN）过期后立即删除并返回未命中
+			// 已缓存的负响应（NXDOMAIN）过期后不再返回陈旧值，直接删除并按未命中回源
 			if !isCloud && rcode != dns.RcodeSuccess {
 				shard.mu.Lock()
 				delete(shard.store, key)
 				shard.mu.Unlock()
 				return nil, false, false, 0
 			}
-
-			// 过期的成功响应：返回旧值并由上层通过单飞行触发后台刷新
+			// 超出过期宽限：删除条目并按未命中处理，由本次请求同步回源刷新（不做后台刷新）
+			if grace := c.staleGrace(); grace <= 0 || now.After(expireAt.Add(grace)) {
+				shard.mu.Lock()
+				delete(shard.store, key)
+				shard.mu.Unlock()
+				return nil, false, false, 0
+			}
+			// 宽限内：返回旧响应（TTL 压小），不再触发任何后台刷新
 			if isCloud && cloudResponse != nil {
 				resp := cloudResponse.Copy()
 				c.adjustExpiredResponseTTL(resp, 5*time.Second)

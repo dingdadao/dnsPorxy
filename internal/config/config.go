@@ -82,6 +82,7 @@ func (e ECSPolicy) Resolve() (netip.Prefix, bool) {
 type CacheConfig struct {
 	MaxItems        int           // 最大缓存条目数
 	TTL             time.Duration // 兜底缓存TTL：上游未提供TTL时使用，不再抬高上游TTL
+	StaleTTL        time.Duration // 过期宽限：条目过期后仍可在该时长内把旧响应返回客户端（0=禁用，过期即未命中）
 	MaxAsyncWorkers int           // 最大异步工作线程数
 }
 
@@ -357,6 +358,7 @@ func DefaultConfig() *Config {
 		Cache: CacheConfig{
 			MaxItems:        5000,
 			TTL:             5 * time.Minute,
+			StaleTTL:        5 * time.Minute,
 			MaxAsyncWorkers: 2,
 		},
 		QueryLog: QueryLogConfig{
@@ -461,6 +463,10 @@ func ValidateConfig(cfg *Config) error {
 	}
 	if cfg.Cache.MaxAsyncWorkers <= 0 {
 		cfg.Cache.MaxAsyncWorkers = 2
+	}
+	// 过期宽限允许为 0（禁用 serve-stale），仅把负值归零避免出现"负宽限"
+	if cfg.Cache.StaleTTL < 0 {
+		cfg.Cache.StaleTTL = 0
 	}
 	if cfg.QueryLog.Retention <= 0 {
 		cfg.QueryLog.Retention = DefaultQueryLogRetention

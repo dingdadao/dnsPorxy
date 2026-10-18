@@ -597,6 +597,8 @@ const SECTIONS = [
     { title:"缓存", body:[
       { id:"cache.ttl", label:"兜底缓存 TTL", type:"duration", placeholder:"5m",
         help:"上游响应未携带 TTL 时使用；不会抬高上游给定的 TTL" },
+      { id:"cache.stale_ttl", label:"过期宽限（serve-stale）", type:"duration", placeholder:"5m",
+        help:"缓存条目过期后仍在该时长内返回旧响应（TTL 压到 5s），超出才按未命中由本次请求同步回源；填 0 关闭该行为" },
     ]},
     { kind:"advanced", title:"缓存容量（修改需重启进程）", body:[
       { id:"cache.max_items", label:"最大缓存条目数", type:"number", restart:true },
@@ -658,6 +660,7 @@ function humanizeConfig(c) {
   const durs = ["timeout","modern_timeout","replace_cache_time","network_refresh","doh3_quic_max_idle","doh3_quic_keepalive"];
   durs.forEach(k => { if (c[k]) c[k] = humanDur(c[k]); });
   if (c.cache && c.cache.ttl) c.cache.ttl = humanDur(c.cache.ttl);
+  if (c.cache && c.cache.stale_ttl) c.cache.stale_ttl = humanDur(c.cache.stale_ttl);
   if (c.query_log && c.query_log.retention) c.query_log.retention = humanDur(c.query_log.retention);
   if (!Array.isArray(c.split_lists)) c.split_lists = [];
   /* 全局默认解析模式：空值按「并发竞速」归一化 */

@@ -547,9 +547,10 @@ func TestNormalEntryKeepsNoObjectTree(t *testing.T) {
 	}
 }
 
-// TestExpiredFromWireReturnsStale 过期成功响应必须仍能返回陈旧内容（TTL 调整为 5s）
+// TestExpiredFromWireReturnsStale 过期成功响应在宽限内必须仍能返回陈旧内容（TTL 调整为 5s）
 func TestExpiredFromWireReturnsStale(t *testing.T) {
 	cache, domain := newWireTestCache(t, "Example.COM.")
+	cache.SetStaleTTL(time.Hour) // 开启过期宽限（serve-stale）
 	key := cache.key("-", domain, dns.TypeA)
 	shard := cache.getShard(key)
 	shard.mu.Lock()
@@ -586,6 +587,84 @@ func TestExpiredNXDOMAINFromWireIsMiss(t *testing.T) {
 	}
 	if e := entryOf(c, "-", "nx.example.com", dns.TypeA); e != nil {
 		t.Errorf("过期 NXDOMAIN 条目应被删除")
+	}
+}
+
+// expireEntryAt 把条目过期时间设为指定时刻，用于构造「已过期」场景
+func expireEntryAt(c *OptimizedDNSCache, scope, domain string, qtype uint16, at time.Time) {
+	key := c.key(scope, domain, qtype)
+	shard := c.getShard(key)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+	if e, ok := shard.store[key]; ok {
+		e.ExpireAt = at
+	}
+}
+
+// TestStaleWithinGraceReturnsOldValue 过期但仍在宽限内：应返回旧值（TTL 压到 5s），且条目保留
+func TestStaleWithinGraceReturnsOldValue(t *testing.T) {
+	c := NewOptimizedDNSCache(4096, time.Minute)
+	c.SetStaleTTL(time.Hour)
+	domain := "stale.example.com"
+	c.Set("-", domain, dns.TypeA, wireTestResponse("stale.example.com."), false)
+	expireEntryAt(c, "-", domain, dns.TypeA, time.Now().Add(-10*time.Second)) // 过期 10s，仍在 1h 宽限内
+
+	resp, hit, _, _ := c.Get("-", domain, dns.TypeA)
+	if !hit || resp == nil {
+		t.Fatalf("宽限内应命中旧值: hit=%v resp=%v", hit, resp != nil)
+	}
+	for _, rr := range resp.Answer {
+		if rr.Header().Ttl != 5 {
+			t.Errorf("陈旧响应 Answer TTL 应压到 5s, got %d (%s)", rr.Header().Ttl, rr.Header().Name)
+		}
+	}
+	if entryOf(c, "-", domain, dns.TypeA) == nil {
+		t.Errorf("宽限内条目不应被删除")
+	}
+}
+
+// TestStaleBeyondGraceIsMissAndDeleted 超出宽限：应返回未命中并删除条目（由本次请求同步回源）
+func TestStaleBeyondGraceIsMissAndDeleted(t *testing.T) {
+	c := NewOptimizedDNSCache(4096, time.Minute)
+	c.SetStaleTTL(5 * time.Minute)
+	domain := "stale2.example.com"
+	c.Set("-", domain, dns.TypeA, wireTestResponse("stale2.example.com."), false)
+	expireEntryAt(c, "-", domain, dns.TypeA, time.Now().Add(-10*time.Minute)) // 过期 10m，超出 5m 宽限
+
+	if _, hit, _, _ := c.Get("-", domain, dns.TypeA); hit {
+		t.Fatalf("超出宽限应返回未命中")
+	}
+	if entryOf(c, "-", domain, dns.TypeA) != nil {
+		t.Errorf("超出宽限的条目应被删除")
+	}
+}
+
+// TestStaleDisabledExpiredIsMiss stale_ttl=0 禁用 serve-stale：过期即未命中并删除
+func TestStaleDisabledExpiredIsMiss(t *testing.T) {
+	c := NewOptimizedDNSCache(4096, time.Minute) // 未调用 SetStaleTTL，默认 0=禁用
+	domain := "stale3.example.com"
+	c.Set("-", domain, dns.TypeA, wireTestResponse("stale3.example.com."), false)
+	expireEntryAt(c, "-", domain, dns.TypeA, time.Now().Add(-time.Second))
+
+	if _, hit, _, _ := c.Get("-", domain, dns.TypeA); hit {
+		t.Fatalf("禁用宽限时过期应返回未命中")
+	}
+	if entryOf(c, "-", domain, dns.TypeA) != nil {
+		t.Errorf("禁用宽限时过期条目应被删除")
+	}
+}
+
+// TestStaleWithinGraceViaFlight 单飞行路径的宽限内陈旧返回与 Get 一致
+func TestStaleWithinGraceViaFlight(t *testing.T) {
+	c := NewOptimizedDNSCache(4096, time.Minute)
+	c.SetStaleTTL(time.Hour)
+	domain := "stale4.example.com"
+	c.Set("-", domain, dns.TypeA, wireTestResponse("stale4.example.com."), false)
+	expireEntryAt(c, "-", domain, dns.TypeA, time.Now().Add(-10*time.Second))
+
+	resp, hit, _, _ := c.GetWithFlight("-", domain, dns.TypeA)
+	if !hit || resp == nil {
+		t.Fatalf("单飞行宽限内应命中旧值: hit=%v resp=%v", hit, resp != nil)
 	}
 }
 

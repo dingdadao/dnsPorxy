@@ -75,6 +75,9 @@ func NewCacheManager(cfg *config.Config, logger *utils.EnhancedLogger) *CacheMan
 	// 启动异步工作池
 	cm.startAsyncWorkers()
 
+	// 过期宽限（serve-stale 窗口）从配置传导到缓存层
+	cm.cache.SetStaleTTL(cfg.Cache.StaleTTL)
+
 	// 按需刷新模式下不启动定期扫描任务
 	// if cfg.Cache.EnableAsyncRefresh {
 	// 	go cm.startCacheScanTask()
@@ -104,6 +107,8 @@ func (cm *CacheManager) UpdateConfig(cfg *config.Config) {
 	cm.cfgMu.Unlock()
 	// 兜底TTL热更新传导到缓存层（容量/线程数仍需重启）
 	cm.cache.SetDefaultTTL(cfg.Cache.TTL)
+	// 过期宽限热更新传导到缓存层
+	cm.cache.SetStaleTTL(cfg.Cache.StaleTTL)
 }
 
 // Get 获取缓存（默认 scope "-"）
@@ -129,11 +134,7 @@ func (cm *CacheManager) GetScoped(scope, domain string, qtype uint16) (*dns.Msg,
 			"is_cloud": isCloud,
 			"hit_type": "normal_cache",
 		})
-
-		// 检查是否需要按需刷新（缓存已过期但仍有条目）
-		if cm.shouldRefreshOnDemand(domain, qtype) { // 异步刷新默认启用
-			cm.submitOnDemandRefresh(domain, qtype)
-		}
+		// 命中（含宽限内的过期旧值）一律不触发后台刷新：过期旧值由客户端下次重查时同步回源
 	} else {
 		cm.logger.Debug("🔍 缓存未命中详细信息", map[string]interface{}{
 			"domain": domain,
@@ -181,11 +182,7 @@ func (cm *CacheManager) GetCloudResponseScoped(scope, domain string, qtype uint1
 			"cloud_type": cloudType,
 			"hit_type":   "cloud_response_cache",
 		})
-
-		// 检查是否需要刷新
-		if cm.shouldRefresh(domain, qtype) { // 异步刷新默认启用
-			cm.submitAsyncRefresh(domain, qtype, time.Now().Add(cm.getConfig().Cache.TTL), 1)
-		}
+		// 命中不再触发后台刷新，过期由 Get 的宽限逻辑与客户端重查处理
 	} else {
 		cm.logger.Debug("☁️ 云响应缓存未命中详细信息", map[string]interface{}{
 			"domain": domain,
@@ -238,11 +235,7 @@ func (cm *CacheManager) GetWithFlightScoped(scope, domain string, qtype uint16) 
 			"qtype":  dns.TypeToString[qtype],
 			"scope":  scope,
 		})
-
-		// 检查是否需要按需刷新（缓存已过期但仍有条目）
-		if cm.shouldRefreshOnDemand(domain, qtype) { // 异步刷新默认启用
-			cm.submitOnDemandRefresh(domain, qtype)
-		}
+		// 命中（含宽限内的过期旧值）一律不触发后台刷新：过期旧值由客户端下次重查时同步回源
 	} else {
 		cm.logger.Debug("🔍 单飞行缓存未命中", map[string]interface{}{
 			"domain": domain,
@@ -386,25 +379,36 @@ func (cm *CacheManager) SetScoped(scope, domain string, qtype uint16, response *
 		return
 	}
 
-	// 检查是否为失败的DNS响应（如NXDOMAIN），负缓存遵循SOA的negative TTL（RFC 2308）
+	// 非成功响应缓存策略（对齐 AdGuard Home）：
+	//   NXDOMAIN 且 Authority 段含 SOA → 负缓存（RFC 2308，TTL 取最小记录 TTL）
+	//   SERVFAIL → 短缓存 15s，避免上游抖动被放大成连续失败
+	//   其余非成功响应 → 不缓存
 	if response.Rcode != dns.RcodeSuccess {
-		negTTL := soaNegativeTTL(response, 5*time.Second)
-		cm.cache.SetWithTTL(scope, domain, qtype, response, isCloud, negTTL, cloudType...)
-		cm.logger.Debug("💾 失败响应已缓存（负缓存TTL）", map[string]interface{}{
+		if ttl, ok := nonSuccessCacheTTL(response); ok {
+			cm.cache.SetWithTTL(scope, domain, qtype, response, isCloud, ttl, cloudType...)
+			cm.logger.Debug("非成功响应已缓存", map[string]interface{}{
+				"domain": domain,
+				"qtype":  dns.TypeToString[qtype],
+				"rcode":  dns.RcodeToString[response.Rcode],
+				"ttl":    ttl.String(),
+			})
+			return
+		}
+		cm.logger.Debug("非成功响应不可缓存", map[string]interface{}{
 			"domain": domain,
 			"qtype":  dns.TypeToString[qtype],
 			"rcode":  dns.RcodeToString[response.Rcode],
-			"ttl":    negTTL.String(),
 		})
-	} else {
-		// 缓存普通成功响应
-		cm.cache.Set(scope, domain, qtype, response, isCloud, cloudType...)
-		cm.logger.Debug("💾 普通响应已缓存", map[string]interface{}{
-			"domain": domain,
-			"qtype":  dns.TypeToString[qtype],
-			"rcode":  dns.RcodeToString[response.Rcode],
-		})
+		return
 	}
+
+	// 缓存普通成功响应
+	cm.cache.Set(scope, domain, qtype, response, isCloud, cloudType...)
+	cm.logger.Debug("💾 普通响应已缓存", map[string]interface{}{
+		"domain": domain,
+		"qtype":  dns.TypeToString[qtype],
+		"rcode":  dns.RcodeToString[response.Rcode],
+	})
 }
 
 // SetWithTTL 设置缓存（使用自定义TTL，默认 scope "-"）
@@ -443,66 +447,111 @@ func (cm *CacheManager) SetWithTTLScoped(scope, domain string, qtype uint16, res
 		return
 	}
 
-	// 检查是否为失败的DNS响应（如NXDOMAIN），负缓存遵循SOA的negative TTL（RFC 2308）
+	// 非成功响应缓存策略（对齐 AdGuard Home）：
+	//   NXDOMAIN 且 Authority 段含 SOA → 负缓存（RFC 2308，TTL 取最小记录 TTL）
+	//   SERVFAIL → 短缓存 15s，避免上游抖动被放大成连续失败
+	//   其余非成功响应 → 不缓存
 	if response.Rcode != dns.RcodeSuccess {
-		negTTL := soaNegativeTTL(response, 5*time.Second)
-		cm.cache.SetWithTTL(scope, domain, qtype, response, isCloud, negTTL, cloudType...)
-		cm.logger.Debug("💾 失败响应已缓存（负缓存TTL）", map[string]interface{}{
+		if ttl, ok := nonSuccessCacheTTL(response); ok {
+			cm.cache.SetWithTTL(scope, domain, qtype, response, isCloud, ttl, cloudType...)
+			cm.logger.Debug("非成功响应已缓存", map[string]interface{}{
+				"domain": domain,
+				"qtype":  dns.TypeToString[qtype],
+				"rcode":  dns.RcodeToString[response.Rcode],
+				"ttl":    ttl.String(),
+			})
+			return
+		}
+		cm.logger.Debug("非成功响应不可缓存", map[string]interface{}{
 			"domain": domain,
 			"qtype":  dns.TypeToString[qtype],
 			"rcode":  dns.RcodeToString[response.Rcode],
-			"ttl":    negTTL.String(),
 		})
-	} else {
-		// 使用自定义TTL缓存响应
-		cm.cache.SetWithTTL(scope, domain, qtype, response, isCloud, customTTL, cloudType...)
-		cm.logger.Debug("💾 普通响应已缓存", map[string]interface{}{
-			"domain": domain,
-			"qtype":  dns.TypeToString[qtype],
-			"rcode":  dns.RcodeToString[response.Rcode],
-		})
+		return
 	}
+
+	// 使用自定义TTL缓存响应
+	cm.cache.SetWithTTL(scope, domain, qtype, response, isCloud, customTTL, cloudType...)
+	cm.logger.Debug("💾 普通响应已缓存", map[string]interface{}{
+		"domain": domain,
+		"qtype":  dns.TypeToString[qtype],
+		"rcode":  dns.RcodeToString[response.Rcode],
+	})
 }
 
-// soaNegativeTTL 从响应的Authority段提取SOA的负缓存TTL（RFC 2308：取SOA.MINIMUM与SOA TTL的较小值）
-func soaNegativeTTL(response *dns.Msg, fallback time.Duration) time.Duration {
-	if response != nil {
-		for _, rr := range response.Ns {
-			if soa, ok := rr.(*dns.SOA); ok {
-				ttl := soa.Hdr.Ttl
-				if soa.Minttl < ttl {
-					ttl = soa.Minttl
-				}
-				if ttl > 0 {
-					return time.Duration(ttl) * time.Second
-				}
+// servFailCacheTTL SERVFAIL 的短缓存时长（上限 15s）
+const servFailCacheTTL = 15 * time.Second
+
+// nonSuccessCacheTTL 返回非成功响应可用的缓存 TTL（与 AdGuard Home 对齐）：
+// SERVFAIL 固定短缓存 15s；NXDOMAIN 且 Authority 含 SOA 走 RFC 2308 负缓存；其余不可缓存
+func nonSuccessCacheTTL(m *dns.Msg) (time.Duration, bool) {
+	if m == nil {
+		return 0, false
+	}
+	if m.Rcode == dns.RcodeServerFailure {
+		return servFailCacheTTL, true
+	}
+	return cacheableNegativeTTL(m)
+}
+
+// cacheableNegativeTTL 判定非成功响应是否可做负缓存并返回其 TTL（RFC 2308，与 dnsproxy 一致）：
+// 仅 NXDOMAIN 且 Authority 段含 SOA、不含 NS 时可缓存；TTL 取整条响应中最小的记录 TTL
+func cacheableNegativeTTL(m *dns.Msg) (time.Duration, bool) {
+	if m == nil || m.Rcode != dns.RcodeNameError {
+		return 0, false
+	}
+	var hasSOA, hasNS bool
+	var minTTL uint32
+	for _, rr := range m.Ns {
+		if rr == nil {
+			continue
+		}
+		switch rr.(type) {
+		case *dns.SOA:
+			hasSOA = true
+		case *dns.NS:
+			hasNS = true
+		}
+	}
+	if !hasSOA || hasNS {
+		return 0, false
+	}
+	for _, sec := range [][]dns.RR{m.Answer, m.Ns, m.Extra} {
+		for _, rr := range sec {
+			if rr == nil {
+				continue
+			}
+			if t := rr.Header().Ttl; t > 0 && (minTTL == 0 || t < minTTL) {
+				minTTL = t
 			}
 		}
 	}
-	return fallback
+	if minTTL == 0 {
+		return 0, false
+	}
+	return time.Duration(minTTL) * time.Second, true
 }
 
 // isValidDNSResponse 验证DNS响应是否值得缓存
-// 缓存 NOERROR 响应，包括有答案和无答案的情况
+// 成功响应（NOERROR）、SERVFAIL 短缓存、以及可负缓存的 NXDOMAIN（Authority 含 SOA）均值得缓存
 func (cm *CacheManager) isValidDNSResponse(domain string, qtype uint16, response *dns.Msg) bool {
 	if response == nil {
 		return false
 	}
 
-	// 只缓存成功的响应（NOERROR）
-	if response.Rcode != dns.RcodeSuccess {
-		// 记录非成功响应，但不缓存
-		cm.logger.Debug("🔍 DNS响应非成功，不缓存", map[string]interface{}{
-			"domain": domain,
-			"qtype":  dns.TypeToString[qtype],
-			"rcode":  dns.RcodeToString[response.Rcode],
-		})
-		return false
+	if response.Rcode == dns.RcodeSuccess {
+		return true
+	}
+	if _, ok := nonSuccessCacheTTL(response); ok {
+		return true
 	}
 
-	// NOERROR响应可以缓存，无论是否有答案记录
-	// 这样可以避免对不存在记录的重复查询
-	return true
+	cm.logger.Debug("🔍 DNS响应非成功，不缓存", map[string]interface{}{
+		"domain": domain,
+		"qtype":  dns.TypeToString[qtype],
+		"rcode":  dns.RcodeToString[response.Rcode],
+	})
+	return false
 }
 
 // isInvalidIP 检查IP地址是否为无效/不应该缓存的IP

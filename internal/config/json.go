@@ -211,6 +211,7 @@ type ECSPolicyJSON struct {
 type CacheJSON struct {
 	MaxItems        int    `json:"max_items"`
 	TTL             string `json:"ttl"`
+	StaleTTL        string `json:"stale_ttl"`
 	MaxAsyncWorkers int    `json:"max_async_workers"`
 }
 
@@ -309,6 +310,7 @@ func (c *Config) ToJSON() *ConfigJSON {
 		Cache: CacheJSON{
 			MaxItems:        c.Cache.MaxItems,
 			TTL:             c.Cache.TTL.String(),
+			StaleTTL:        c.Cache.StaleTTL.String(),
 			MaxAsyncWorkers: c.Cache.MaxAsyncWorkers,
 		},
 		QueryLog: QueryLogJSON{
@@ -590,6 +592,9 @@ func (j *ConfigJSON) ToConfig() (*Config, error) {
 	}
 	if cfg.Cache.TTL, err = parseDuration(j.Cache.TTL, def.Cache.TTL); err != nil {
 		return nil, fmt.Errorf("cache.ttl: %w", err)
+	}
+	if cfg.Cache.StaleTTL, err = parseDuration(j.Cache.StaleTTL, def.Cache.StaleTTL); err != nil {
+		return nil, fmt.Errorf("cache.stale_ttl: %w", err)
 	}
 	if cfg.QueryLog.Retention, err = parseDuration(j.QueryLog.Retention, queryLog.Retention); err != nil {
 		return nil, fmt.Errorf("query_log.retention: %w", err)
