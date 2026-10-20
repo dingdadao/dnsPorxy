@@ -17,7 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"cosDnaPorxy/internal/utils"
+	"dnsPorxy/internal/utils"
 
 	_ "modernc.org/sqlite" // 纯Go SQLite驱动（免cgo）
 )

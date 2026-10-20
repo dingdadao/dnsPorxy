@@ -1,7 +1,7 @@
 package utils
 
 import (
-	"cosDnaPorxy/internal/config"
+	"dnsPorxy/internal/config"
 	"fmt"
 	"os"
 	"path/filepath"

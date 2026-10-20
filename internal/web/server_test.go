@@ -10,10 +10,10 @@ import (
 	"testing"
 	"time"
 
-	"cosDnaPorxy/internal/config"
-	"cosDnaPorxy/internal/dns"
-	"cosDnaPorxy/internal/querylog"
-	"cosDnaPorxy/internal/utils"
+	"dnsPorxy/internal/config"
+	"dnsPorxy/internal/dns"
+	"dnsPorxy/internal/querylog"
+	"dnsPorxy/internal/utils"
 )
 
 // newTestAPIServer 构造测试用API服务器（临时目录 + 临时数据库 + nil handler）

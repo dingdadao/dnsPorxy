@@ -4,7 +4,7 @@ import (
 	"strings"
 	"time"
 
-	"cosDnaPorxy/internal/querylog"
+	"dnsPorxy/internal/querylog"
 
 	"github.com/miekg/dns"
 )

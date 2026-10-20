@@ -14,11 +14,11 @@ import (
 	"syscall"
 	"time"
 
-	"cosDnaPorxy/internal/config"
-	"cosDnaPorxy/internal/dns"
-	"cosDnaPorxy/internal/querylog"
-	"cosDnaPorxy/internal/utils"
-	"cosDnaPorxy/internal/web"
+	"dnsPorxy/internal/config"
+	"dnsPorxy/internal/dns"
+	"dnsPorxy/internal/querylog"
+	"dnsPorxy/internal/utils"
+	"dnsPorxy/internal/web"
 )
 
 // RecoveryManager panic恢复管理器

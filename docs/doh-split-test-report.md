@@ -1,7 +1,7 @@
 # dnsproxy 线上测试报告：DoH 客户端分流 + 云替换多线路 + 性能
 
 > 执行时间：2026-10-12　　目标：`10.0.0.30`（生产，2 核 / 512MB，systemd `dnsproxy`）
-> 配套资产：[测试用例设计](file:///Users/dension/WorkBuddy/dnsproxy/cosDnaPorxy/docs/doh-split-testcases.md) ｜ [功能测试脚本](file:///Users/dension/WorkBuddy/dnsproxy/cosDnaPorxy/scripts/test_doh_split.py) ｜ [性能测试脚本](file:///Users/dension/WorkBuddy/dnsproxy/cosDnaPorxy/scripts/perf_doh.py)
+> 配套资产：[测试用例设计](file:///Users/dension/GolandProjects/dnsPorxy/docs/doh-split-testcases.md) ｜ [功能测试脚本](file:///Users/dension/GolandProjects/dnsPorxy/scripts/test_doh_split.py) ｜ [性能测试脚本](file:///Users/dension/GolandProjects/dnsPorxy/scripts/perf_doh.py)
 
 ---
 

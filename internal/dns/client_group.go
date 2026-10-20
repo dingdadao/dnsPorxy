@@ -5,8 +5,8 @@ import (
 	"sort"
 	"strings"
 
-	"cosDnaPorxy/internal/config"
-	"cosDnaPorxy/internal/source"
+	"dnsPorxy/internal/config"
+	"dnsPorxy/internal/source"
 )
 
 // ISPLookup 客户端运营商识别抽象（注入到匹配器，便于替换实现与测试）

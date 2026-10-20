@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"cosDnaPorxy/internal/utils"
+	"dnsPorxy/internal/utils"
 )
 
 func generateCert(t *testing.T, domains []string) ([]byte, []byte) {

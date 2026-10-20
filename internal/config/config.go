@@ -337,7 +337,7 @@ func DefaultConfig() *Config {
 				Enabled:    true,
 				DNS:        []string{"https://223.6.6.6/dns-query"},
 				DomainFile: "./data/designated.yaml",
-				DomainURL:  "https://raw.githubusercontent.com/dingdadao/cosDnaPorxy/refs/heads/master/scripts/shell/designated.yaml",
+				DomainURL:  "https://raw.githubusercontent.com/dingdadao/dnsPorxy/refs/heads/master/scripts/shell/designated.yaml",
 				Refresh:    30 * time.Minute,
 			},
 			{

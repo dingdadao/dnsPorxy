@@ -7,7 +7,7 @@ import (
 	"strings"
 	"sync"
 
-	"cosDnaPorxy/internal/utils"
+	"dnsPorxy/internal/utils"
 
 	"gopkg.in/yaml.v3"
 )

@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"cosDnaPorxy/internal/utils"
+	"dnsPorxy/internal/utils"
 
 	"github.com/miekg/dns"
 )

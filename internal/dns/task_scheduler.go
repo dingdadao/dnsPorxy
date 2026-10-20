@@ -4,8 +4,8 @@ import (
 	"context"
 	"time"
 
-	"cosDnaPorxy/internal/config"
-	"cosDnaPorxy/internal/utils"
+	"dnsPorxy/internal/config"
+	"dnsPorxy/internal/utils"
 )
 
 // TaskScheduler 处理定时任务调度

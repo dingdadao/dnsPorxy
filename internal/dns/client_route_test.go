@@ -4,8 +4,8 @@ import (
 	"testing"
 	"time"
 
-	"cosDnaPorxy/internal/config"
-	"cosDnaPorxy/internal/utils"
+	"dnsPorxy/internal/config"
+	"dnsPorxy/internal/utils"
 )
 
 // newRouteFixture 构造只含路由所需依赖的 handler（配置 + 分流匹配器），

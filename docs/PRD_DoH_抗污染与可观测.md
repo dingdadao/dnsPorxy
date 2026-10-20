@@ -38,7 +38,7 @@
 ### 3.1 设计原则
 > 「就是目前的客户端 IP 分流功能，复用现在的 DNS 逻辑，只是处理一些配置上的差异。」——用户定调
 
-不新建路由引擎。在现有 `ClientGroup`（[client_group.go](file:///Users/dension/WorkBuddy/dnsproxy/cosDnaPorxy/internal/dns/client_group.go#L136-L148)：按来源 IP → 上游/DNSMode/ECS/IPPrefer/AllowDomainSplit）+ 现有 [query.go](file:///Users/dension/WorkBuddy/dnsproxy/cosDnaPorxy/internal/dns/query.go)（上游竞速/failover + BackupDNS 回退）之上，做**配置面增强**。
+不新建路由引擎。在现有 `ClientGroup`（[client_group.go](file:///Users/dension/GolandProjects/dnsPorxy/internal/dns/client_group.go#L136-L148)：按来源 IP → 上游/DNSMode/ECS/IPPrefer/AllowDomainSplit）+ 现有 [query.go](file:///Users/dension/GolandProjects/dnsPorxy/internal/dns/query.go)（上游竞速/failover + BackupDNS 回退）之上，做**配置面增强**。
 
 ### 3.2 配置差异点（新增/扩展）
 对现有 `ClientGroup` 增加「加密出口 + 污染防护」相关字段：
@@ -72,10 +72,10 @@
 ## 4. 需求 B-1：解析日志增强
 
 ### 4.1 现状（基线）
-[store.go](file:///Users/dension/WorkBuddy/dnsproxy/cosDnaPorxy/internal/querylog/store.go#L56-L70)：`Entry` 已含 client(IP)、qtype、action、dns_mode、rcode、elapsed_ms；表 [query_logs](file:///Users/dension/WorkBuddy/dnsproxy/cosDnaPorxy/internal/querylog/store.go#L199-L217) 已有对应列。`Filter` 仅支持 keyword/action/qtype/时间；**client 只能靠 keyword 模糊搜，无独立来源筛选，无 protocol、无污染标记**。
+[store.go](file:///Users/dension/GolandProjects/dnsPorxy/internal/querylog/store.go#L56-L70)：`Entry` 已含 client(IP)、qtype、action、dns_mode、rcode、elapsed_ms；表 [query_logs](file:///Users/dension/GolandProjects/dnsPorxy/internal/querylog/store.go#L199-L217) 已有对应列。`Filter` 仅支持 keyword/action/qtype/时间；**client 只能靠 keyword 模糊搜，无独立来源筛选，无 protocol、无污染标记**。
 
 ### 4.2 变更
-1. **新增列 `protocol`**：`udp/tcp/doh/dot/doh3`（写入口 [insertBatch](file:///Users/dension/WorkBuddy/dnsproxy/cosDnaPorxy/internal/querylog/store.go#L626-L647) 对应补一列；旧库 `ALTER TABLE` 兼容，历史默认空）。
+1. **新增列 `protocol`**：`udp/tcp/doh/dot/doh3`（写入口 [insertBatch](file:///Users/dension/GolandProjects/dnsPorxy/internal/querylog/store.go#L626-L647) 对应补一列；旧库 `ALTER TABLE` 兼容，历史默认空）。
 2. **新增列 `anomaly`**：空 / `polluted` / `slow` / `refused` 等标记（G2 检测结果落到这里）。
 3. **`Filter` 新增**独立字段：`client`（精确 IP 或 CIDR）、`protocol`、`anomaly`；并加 `buildWhere` 对应分支。
 4. **UI 日志页**：筛选栏增加 协议下拉、来源输入、异常下拉；污染行高亮。
@@ -85,7 +85,7 @@
 ## 5. 需求 B-2：统计报表增强
 
 ### 5.1 现状（基线）
-`Summary`（[store.go](file:///Users/dension/WorkBuddy/dnsproxy/cosDnaPorxy/internal/querylog/store.go#L103-L121)）已有 **TopDomains、ByDay(QPS 趋势)、ByAction、ByQType、ByRcode、ByList**。
+`Summary`（[store.go](file:///Users/dension/GolandProjects/dnsPorxy/internal/querylog/store.go#L103-L121)）已有 **TopDomains、ByDay(QPS 趋势)、ByAction、ByQType、ByRcode、ByList**。
 
 ### 5.2 新增（补齐 4 类）
 | 维度 | 说明 |
@@ -99,7 +99,7 @@
 
 ## 6. 数据与 schema 变更（增量汇总）
 
-- `query_logs`：`ALTER TABLE ADD COLUMN protocol TEXT`、`ADD COLUMN anomaly TEXT`（[initSchema](file:///Users/dension/WorkBuddy/dnsproxy/cosDnaPorxy/internal/querylog/store.go#L192-L222)）。
+- `query_logs`：`ALTER TABLE ADD COLUMN protocol TEXT`、`ADD COLUMN anomaly TEXT`（[initSchema](file:///Users/dension/GolandProjects/dnsPorxy/internal/querylog/store.go#L192-L222)）。
 - `Entry` / `insertBatch` / `Query` SELECT 列新增对应字段。
 - `Filter`：新增 `client / protocol / anomaly`；`buildWhere` 扩展。
 - `Summary`：新增 `ByProtocol`、`ByClient`、（`Polluted/Recount` 计数）。

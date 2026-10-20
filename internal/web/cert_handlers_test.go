@@ -16,9 +16,9 @@ import (
 	"testing"
 	"time"
 
-	"cosDnaPorxy/internal/config"
-	"cosDnaPorxy/internal/dns"
-	"cosDnaPorxy/internal/utils"
+	"dnsPorxy/internal/config"
+	"dnsPorxy/internal/dns"
+	"dnsPorxy/internal/utils"
 )
 
 // generateTestCert 生成测试用自签证书

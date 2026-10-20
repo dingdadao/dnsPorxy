@@ -1,11 +1,11 @@
-# cosDnaPorxy 功能说明与查询业务逻辑
+# dnsPorxy 功能说明与查询业务逻辑
 
 > 本文档总结系统功能、查询业务逻辑（重构后），以及本次协议修复与配置简化的修改流程。
 > 问题清单依据见 [DNS_STANDARDS_ANALYSIS.md](DNS_STANDARDS_ANALYSIS.md)。
 
 ## 一、功能总览
 
-cosDnaPorxy 是一个 DNS 代理服务器（默认监听 UDP/TCP `:53`），核心能力：
+dnsPorxy 是一个 DNS 代理服务器（默认监听 UDP/TCP `:53`），核心能力：
 
 | 功能 | 说明 | 主要实现 |
 |---|---|---|

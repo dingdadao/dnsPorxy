@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"cosDnaPorxy/internal/querylog"
-	"cosDnaPorxy/internal/utils"
+	"dnsPorxy/internal/querylog"
+	"dnsPorxy/internal/utils"
 
 	"github.com/miekg/dns"
 )

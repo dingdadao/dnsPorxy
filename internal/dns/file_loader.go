@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"cosDnaPorxy/internal/config"
-	"cosDnaPorxy/internal/utils"
+	"dnsPorxy/internal/config"
+	"dnsPorxy/internal/utils"
 )
 
 // FileLoader 处理文件加载相关功能

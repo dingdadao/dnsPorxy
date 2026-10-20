@@ -13,8 +13,8 @@ import (
 	"sync"
 	"time"
 
-	"cosDnaPorxy/internal/config"
-	"cosDnaPorxy/internal/utils"
+	"dnsPorxy/internal/config"
+	"dnsPorxy/internal/utils"
 
 	"github.com/miekg/dns"
 )

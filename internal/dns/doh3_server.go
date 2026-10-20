@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"cosDnaPorxy/internal/querylog"
-	"cosDnaPorxy/internal/utils"
+	"dnsPorxy/internal/querylog"
+	"dnsPorxy/internal/utils"
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"

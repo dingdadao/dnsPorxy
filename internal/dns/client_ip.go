@@ -6,8 +6,8 @@ import (
 	"net/netip"
 	"strings"
 
-	"cosDnaPorxy/internal/config"
-	"cosDnaPorxy/internal/querylog"
+	"dnsPorxy/internal/config"
+	"dnsPorxy/internal/querylog"
 
 	"github.com/miekg/dns"
 )

@@ -13,10 +13,10 @@ import (
 	"strings"
 	"time"
 
-	"cosDnaPorxy/internal/config"
-	"cosDnaPorxy/internal/dns"
-	"cosDnaPorxy/internal/querylog"
-	"cosDnaPorxy/internal/utils"
+	"dnsPorxy/internal/config"
+	"dnsPorxy/internal/dns"
+	"dnsPorxy/internal/querylog"
+	"dnsPorxy/internal/utils"
 )
 
 //go:embed admin.html

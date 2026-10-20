@@ -4,8 +4,8 @@ import (
 	"net/netip"
 	"testing"
 
-	"cosDnaPorxy/internal/config"
-	"cosDnaPorxy/internal/source"
+	"dnsPorxy/internal/config"
+	"dnsPorxy/internal/source"
 )
 
 // fakeISP 测试用运营商识别器：按固定 IP 返回运营商，其余返回"判不出"

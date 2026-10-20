@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"cosDnaPorxy/internal/config"
-	"cosDnaPorxy/internal/dns"
+	"dnsPorxy/internal/config"
+	"dnsPorxy/internal/dns"
 )
 
 const maxCertBodyBytes = 4 << 20 // 4 MB

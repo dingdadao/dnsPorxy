@@ -15,7 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"cosDnaPorxy/internal/utils"
+	"dnsPorxy/internal/utils"
 )
 
 // CertSource 证书来源类型

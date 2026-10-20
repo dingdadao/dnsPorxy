@@ -4,9 +4,9 @@ import (
 	"log"
 	"os"
 
-	"cosDnaPorxy/internal/config"
-	"cosDnaPorxy/internal/recovery"
-	"cosDnaPorxy/internal/utils"
+	"dnsPorxy/internal/config"
+	"dnsPorxy/internal/recovery"
+	"dnsPorxy/internal/utils"
 )
 
 func main() {

@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"cosDnaPorxy/internal/utils"
+	"dnsPorxy/internal/utils"
 )
 
 func testLogger() *utils.EnhancedLogger {

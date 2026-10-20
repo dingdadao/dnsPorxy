@@ -1,6 +1,6 @@
 # 客户端分组（按运营商）重构 · PDR（产品设计需求文档）
 
-- 项目：cosDnaPorxy DNS 代理
+- 项目：dnsPorxy DNS 代理
 - 日期：2026-10-10
 - 状态：**待评审**（需求已澄清，设计待拍板；本文件为方案稿，未开工）
 - 定位：**修订**《INBOUND_TLS_AND_CLIENT_SPLIT_PDR.md》§4.3「特性 B-2 · 客户端分组 ClientGroup」。入站加密服务（DoT/DoH/DoH3）与证书托管部分**不受影响**。

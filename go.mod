@@ -1,4 +1,4 @@
-module cosDnaPorxy
+module dnsPorxy
 
 go 1.23.0
 

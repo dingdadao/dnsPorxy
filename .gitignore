@@ -103,6 +103,7 @@ build/dnsproxy
 
 # AI 编辑器工作目录（本地设计文档，勿入库）
 .trae/
+.workbuddy-ai/
 
 # Python 缓存（测试脚本运行产物）
 __pycache__/

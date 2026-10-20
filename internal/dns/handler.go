@@ -12,10 +12,10 @@ import (
 	"sync"
 	"time"
 
-	"cosDnaPorxy/internal/config"
-	"cosDnaPorxy/internal/querylog"
-	"cosDnaPorxy/internal/source"
-	"cosDnaPorxy/internal/utils"
+	"dnsPorxy/internal/config"
+	"dnsPorxy/internal/querylog"
+	"dnsPorxy/internal/source"
+	"dnsPorxy/internal/utils"
 
 	"github.com/miekg/dns"
 	"golang.org/x/sync/singleflight"

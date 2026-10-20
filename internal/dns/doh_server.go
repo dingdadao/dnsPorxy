@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"cosDnaPorxy/internal/querylog"
-	"cosDnaPorxy/internal/utils"
+	"dnsPorxy/internal/querylog"
+	"dnsPorxy/internal/utils"
 )
 
 // DoHServer DNS over HTTPS 入站服务器（HTTP/1.1 + HTTP/2）

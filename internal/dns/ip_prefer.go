@@ -3,8 +3,8 @@ package dns
 import (
 	"time"
 
-	"cosDnaPorxy/internal/config"
-	"cosDnaPorxy/internal/querylog"
+	"dnsPorxy/internal/config"
+	"dnsPorxy/internal/querylog"
 
 	"github.com/miekg/dns"
 )

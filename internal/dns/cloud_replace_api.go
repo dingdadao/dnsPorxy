@@ -10,7 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"cosDnaPorxy/internal/utils"
+	"dnsPorxy/internal/utils"
 )
 
 const (

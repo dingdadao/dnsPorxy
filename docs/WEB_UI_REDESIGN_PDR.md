@@ -1,6 +1,6 @@
 # Web 管理端重设计 · PDR（产品设计需求文档）
 
-- 项目：cosDnaPorxy DNS 代理 · Web 配置中心（`internal/web/admin.html`，内嵌单文件）
+- 项目：dnsPorxy DNS 代理 · Web 配置中心（`internal/web/admin.html`，内嵌单文件）
 - 日期：2026-09-23
 - 状态：**待用户确认**，确认后进入开发
 - 边界：本轮只重做前端页面（HTML/CSS/JS）。**后端 API、配置存储、DNS 逻辑零改动**
