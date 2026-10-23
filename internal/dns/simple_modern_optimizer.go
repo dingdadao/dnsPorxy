@@ -44,6 +44,9 @@ type SimpleModernOptimizer struct {
 	doHQueryFunc  func(*dns.Msg, string) (*dns.Msg, error)
 	doTQueryFunc  func(*dns.Msg, string) (*dns.Msg, error)
 	doH3QueryFunc func(*dns.Msg, string) (*dns.Msg, error)
+
+	// pickIndex 权重随机选台函数，默认 pickWeightedIndex；单元测试可替换以保证选台顺序确定
+	pickIndex func([]weightedUpstream, *rand.Rand) int
 }
 
 // NewSimpleModernOptimizer 创建简化的现代DNS查询优化器
@@ -64,6 +67,7 @@ func NewSimpleModernOptimizer(logger *utils.EnhancedLogger, timeout time.Duratio
 		retryCount:     2,
 		enableFallback: true,
 		connCache:      make(map[string]interface{}),
+		pickIndex:      pickWeightedIndex,
 	}
 
 	// 初始化HTTP客户端
@@ -652,8 +656,15 @@ func pickWeightedIndex(ups []weightedUpstream, rnd *rand.Rand) int {
 	return 0
 }
 
-// QueryWeightedRandom 权重随机：按 "#权重" 从有效上游中随机选一台发起查询（每次 miss 只发 1 次），
-// 失败/超时后从其余上游再随机选一台重试，最多尝试 2 台，避免单点故障导致解析失败。
+// wrandomHedgeDelay 权重随机模式的首选上游对冲阈值。
+// 首选在此时长内仍无应答时，立刻并行启动下一台上游，取先到的有效应答。
+// 正常（首选 RTT 小于该阈值）时仍只发 1 次请求；只有慢上游才多付出一次请求，
+// 用来把单台慢上游/丢包造成的 1~3s 尖刺压到「阈值 + 次选 RTT」。
+const wrandomHedgeDelay = 100 * time.Millisecond
+
+// QueryWeightedRandom 权重随机：按 "#权重" 从有效上游中随机选一台发起查询（每次 miss 优先只发 1 次），
+// 首选失败立即换下一台；首选超过 wrandomHedgeDelay 仍未应答则并行对冲下一台（happy-eyeballs 思路），
+// 先到的有效应答即返回。最多尝试 2 台，避免单点故障或慢上游拖高整体时延。
 // 返回结构与 Query/QueryFailover 保持一致，便于上层统一处理。
 func (qo *SimpleModernOptimizer) QueryWeightedRandom(req *dns.Msg, upstreams []string) *ConcurrentQueryResult {
 	start := time.Now()
@@ -669,27 +680,70 @@ func (qo *SimpleModernOptimizer) QueryWeightedRandom(req *dns.Msg, upstreams []s
 	}
 
 	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
+	pick := qo.pickIndex
+	if pick == nil {
+		pick = pickWeightedIndex
+	}
 
-	// 最多尝试 2 台（首选 + 一次回退），候选不足时以实际数量为准
+	// 最多尝试 2 台（首选 + 一次对冲/回退），候选不足时以实际数量为准
 	const maxAttempts = 2
 	attempts := maxAttempts
 	if len(weighted) < attempts {
 		attempts = len(weighted)
 	}
 
+	// 按权重无放回地预先确定尝试顺序，保证对冲时不会重复选中同一台上游
 	remaining := make([]weightedUpstream, len(weighted))
 	copy(remaining, weighted)
+	order := make([]weightedUpstream, 0, attempts)
+	for i := 0; i < attempts; i++ {
+		idx := pick(remaining, rnd)
+		order = append(order, remaining[idx])
+		remaining = append(remaining[:idx], remaining[idx+1:]...)
+	}
+
+	type wrandAttempt struct {
+		choice weightedUpstream
+		result *QueryResult
+	}
+	resultChan := make(chan wrandAttempt, len(order))
+	launch := func(i int) {
+		go func() {
+			resultChan <- wrandAttempt{choice: order[i], result: qo.queryServer(req, order[i].server)}
+		}()
+	}
+
+	launch(0)
+	launched := 1
+	pending := 1
+
+	hedge := time.NewTimer(wrandomHedgeDelay)
+	defer hedge.Stop()
 
 	var allResults []*QueryResult
 	var last *QueryResult
 
-	for i := 0; i < attempts; i++ {
-		idx := pickWeightedIndex(remaining, rnd)
-		choice := remaining[idx]
-		// 移除已尝试的项，避免回退时再次选中同一台
-		remaining = append(remaining[:idx], remaining[idx+1:]...)
+	for pending > 0 {
+		var done wrandAttempt
+		select {
+		case done = <-resultChan:
+			pending--
+		case <-hedge.C:
+			// 首选迟迟无应答：立刻并行发起下一台，谁先给出有效应答就用谁
+			if launched < len(order) {
+				qo.logger.Debug("⏱️ 权重随机模式触发上游对冲", map[string]interface{}{
+					"slow_server": order[launched-1].server,
+					"hedge_server": order[launched].server,
+					"hedge_delay": wrandomHedgeDelay.String(),
+				})
+				launch(launched)
+				launched++
+				pending++
+			}
+			continue
+		}
 
-		result := qo.queryServer(req, choice.server)
+		result := done.result
 		if result == nil {
 			continue
 		}
@@ -698,12 +752,12 @@ func (qo *SimpleModernOptimizer) QueryWeightedRandom(req *dns.Msg, upstreams []s
 
 		if result.Error == nil && result.Response != nil &&
 			(result.Response.Rcode == dns.RcodeSuccess || result.Response.Rcode == dns.RcodeNameError) {
-			// NOERROR / NXDOMAIN 均为终态答案（RFC 2308），无需回退
+			// NOERROR / NXDOMAIN 均为终态答案（RFC 2308），无需再等其它上游
 			result.IsSuccess = true
 			qo.logger.Debug("✅ 权重随机模式查询成功", map[string]interface{}{
-				"server":       choice.server,
-				"weight":       choice.weight,
-				"attempt":      i + 1,
+				"server":       done.choice.server,
+				"weight":       done.choice.weight,
+				"attempt":      len(allResults),
 				"time":         result.ResponseTime.String(),
 				"total_time":   time.Since(start).String(),
 				"answer_count": len(result.Response.Answer),
@@ -719,11 +773,17 @@ func (qo *SimpleModernOptimizer) QueryWeightedRandom(req *dns.Msg, upstreams []s
 			}
 		}
 
-		qo.logger.Debug("⏭️ 权重随机模式当前上游未成功，尝试回退", map[string]interface{}{
-			"server":  choice.server,
-			"attempt": i + 1,
-			"error":   result.Error,
-		})
+		// 当前上游失败：还有未尝试的上游就立即换下一台，不必等对冲计时
+		if launched < len(order) {
+			qo.logger.Debug("⏭️ 权重随机模式当前上游未成功，尝试回退", map[string]interface{}{
+				"server":  done.choice.server,
+				"attempt": len(allResults),
+				"error":   result.Error,
+			})
+			launch(launched)
+			launched++
+			pending++
+		}
 	}
 
 	if last == nil {

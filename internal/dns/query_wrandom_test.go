@@ -5,6 +5,7 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -190,6 +191,58 @@ func TestQueryWeightedRandomRealUpstream(t *testing.T) {
 	}
 	if up.lastRequest(t) == nil {
 		t.Error("上游应收到请求")
+	}
+}
+
+// 首选上游超过对冲阈值仍无应答时，应并行发起次选并采用先到的有效应答，
+// 不再等首选超时，从而消除慢上游造成的秒级尖刺
+func TestQueryWeightedRandomHedgesSlowUpstream(t *testing.T) {
+	logger := utils.NewEnhancedLogger("error", "test", false)
+	req := new(dns.Msg)
+	req.SetQuestion("a.example.com.", dns.TypeA)
+
+	qo := NewSimpleModernOptimizer(logger, 2*time.Second)
+	t.Cleanup(qo.Close)
+	// 固定选台顺序为入参顺序，保证「首选=慢上游」
+	qo.pickIndex = func(_ []weightedUpstream, _ *rand.Rand) int { return 0 }
+	qo.udpQueryFunc = func(_ *dns.Msg, server string) (*dns.Msg, error) {
+		if strings.Contains(server, "slow") {
+			time.Sleep(400 * time.Millisecond)
+		}
+		return wrandomOKResp(req), nil
+	}
+
+	start := time.Now()
+	res := qo.QueryWeightedRandom(req, []string{"udp://slow.example:53#70", "udp://fast.example:53#30"})
+	elapsed := time.Since(start)
+
+	if !res.HasSuccess || res.SuccessResult == nil {
+		t.Fatalf("对冲后应查询成功: %+v", res)
+	}
+	if res.SuccessResult.Server != "udp://fast.example:53" {
+		t.Errorf("应采用先返回的次选上游，实际 %s", res.SuccessResult.Server)
+	}
+	if elapsed >= 300*time.Millisecond {
+		t.Errorf("对冲后应在约 %s + 次选RTT 内返回，实际 %s", wrandomHedgeDelay, elapsed)
+	}
+}
+
+// 仅有一台上游时不会对冲，慢上游的应答仍正常返回
+func TestQueryWeightedRandomSingleUpstreamNoHedge(t *testing.T) {
+	logger := utils.NewEnhancedLogger("error", "test", false)
+	req := new(dns.Msg)
+	req.SetQuestion("a.example.com.", dns.TypeA)
+
+	qo := NewSimpleModernOptimizer(logger, 2*time.Second)
+	t.Cleanup(qo.Close)
+	qo.udpQueryFunc = func(_ *dns.Msg, _ string) (*dns.Msg, error) {
+		time.Sleep(200 * time.Millisecond)
+		return wrandomOKResp(req), nil
+	}
+
+	res := qo.QueryWeightedRandom(req, []string{"udp://only.example:53"})
+	if !res.HasSuccess || res.SuccessResult == nil {
+		t.Fatalf("单台上游应查询成功: %+v", res)
 	}
 }
 
