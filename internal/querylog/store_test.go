@@ -440,3 +440,30 @@ func TestSummaryUsesPerRowBudget(t *testing.T) {
 		}
 	}
 }
+
+// 预算字段必须能原样读回：写入端记录了 budget_ms，读取端（/api/logs）也要带出来，
+// 否则界面上永远显示 0，排查「预算到底有没有生效」时会被误导。
+func TestQueryReturnsBudgetMS(t *testing.T) {
+	s := openTestStore(t, Options{Enabled: true})
+	now := time.Now().Unix()
+	s.Append(Entry{Time: now - 2, Domain: "with-budget.example.com", QType: "A", Action: ActionSplit,
+		ListName: "国外", Rcode: "NOERROR", ElapsedMS: 1200, BudgetMS: 5000})
+	s.Append(Entry{Time: now - 1, Domain: "no-budget.example.com", QType: "A", Action: ActionUpstream,
+		Rcode: "NOERROR", ElapsedMS: 30})
+	waitWritten(t, s, 2)
+
+	rows, _, err := s.Query(Filter{})
+	if err != nil {
+		t.Fatalf("查询日志失败: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("应返回 2 条，实际 %d", len(rows))
+	}
+	// 按时间倒序：第 0 条是 no-budget
+	if rows[0].BudgetMS != 0 {
+		t.Errorf("未设预算的记录 budget_ms 应为 0，实际 %d", rows[0].BudgetMS)
+	}
+	if rows[1].BudgetMS != 5000 {
+		t.Errorf("budget_ms 应原样读回 5000，实际 %d（读取端可能漏了该列）", rows[1].BudgetMS)
+	}
+}

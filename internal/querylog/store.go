@@ -373,7 +373,7 @@ func (s *Store) Query(f Filter) ([]Entry, int64, error) {
 		offset = 0
 	}
 
-	rows, err := s.db.Query(`SELECT id, ts, domain, qtype, client, client_isp, protocol, source_kind, via, action, list_name, dns, dns_mode, ecs, rcode, answers, elapsed_ms
+	rows, err := s.db.Query(`SELECT id, ts, domain, qtype, client, client_isp, protocol, source_kind, via, action, list_name, dns, dns_mode, ecs, rcode, answers, elapsed_ms, budget_ms
 		FROM query_logs`+where+` ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?`,
 		append(args, limit, offset)...)
 	if err != nil {
@@ -386,7 +386,7 @@ func (s *Store) Query(f Filter) ([]Entry, int64, error) {
 		var e Entry
 		if err := rows.Scan(&e.ID, &e.Time, &e.Domain, &e.QType, &e.Client, &e.ClientISP,
 			&e.Protocol, &e.SourceKind, &e.Via, &e.Action,
-			&e.ListName, &e.DNS, &e.DNSMode, &e.ECS, &e.Rcode, &e.Answers, &e.ElapsedMS); err != nil {
+			&e.ListName, &e.DNS, &e.DNSMode, &e.ECS, &e.Rcode, &e.Answers, &e.ElapsedMS, &e.BudgetMS); err != nil {
 			return nil, 0, fmt.Errorf("读取解析日志失败: %w", err)
 		}
 		list = append(list, e)
