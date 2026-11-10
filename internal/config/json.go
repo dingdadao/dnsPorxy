@@ -7,6 +7,16 @@ import (
 	"time"
 )
 
+// durOrEmpty 可选时长转字符串：0 输出空串。
+// 「总查询超时」用 0 表示跟随上一层（列表→全局→不限制），空串比 "0s" 更直观，
+// 也让管理端把该输入框留空即等于"不单独配置"。
+func durOrEmpty(d time.Duration) string {
+	if d == 0 {
+		return ""
+	}
+	return d.String()
+}
+
 // ConfigJSON 配置的 JSON 表示（web API 与 SQLite 存储共用）
 // 时长字段统一使用 "1.5s"、"5m"、"24h" 格式的字符串，便于阅读与编辑
 type ConfigJSON struct {
@@ -16,6 +26,7 @@ type ConfigJSON struct {
 	Upstream              []string        `json:"upstream"`
 	Timeout               string          `json:"timeout"`
 	ModernTimeout         string          `json:"modern_timeout"`
+	QueryTimeout          string          `json:"query_timeout"`
 	ReplaceCacheTime      string          `json:"replace_cache_time"`
 	MaxIPRecords          int             `json:"max_ip_records"`
 	CNAMERecursionDepth   int             `json:"cname_recursion_depth"`
@@ -113,6 +124,7 @@ type SplitListJSON struct {
 	Invert           bool          `json:"invert"`
 	DNS              stringOrList  `json:"dns"`
 	DNSMode          string        `json:"dns_mode"`
+	QueryTimeout     string        `json:"query_timeout"`
 	DomainFile       string        `json:"domain_file"`
 	DomainURL        string        `json:"domain_url"`
 	Refresh          string        `json:"refresh"`
@@ -138,6 +150,7 @@ type ISPGroupJSON struct {
 	SplitRefs    stringOrList           `json:"split_refs"`
 	FallbackDNS  stringOrList           `json:"fallback_dns"`
 	DNSMode      string                 `json:"dns_mode"`
+	QueryTimeout string                 `json:"query_timeout"`
 	IPPrefer     string                 `json:"ip_prefer"`
 	ECS          ECSPolicyJSON          `json:"ecs"`
 	CloudReplace CloudReplacePolicyJSON `json:"cloud_replace"`
@@ -156,6 +169,7 @@ type CustomGroupJSON struct {
 	SplitRefs    stringOrList           `json:"split_refs"`
 	FallbackDNS  stringOrList           `json:"fallback_dns"`
 	DNSMode      string                 `json:"dns_mode"`
+	QueryTimeout string                 `json:"query_timeout"`
 	IPPrefer     string                 `json:"ip_prefer"`
 	ECS          ECSPolicyJSON          `json:"ecs"`
 	CloudReplace CloudReplacePolicyJSON `json:"cloud_replace"`
@@ -232,6 +246,7 @@ func (c *Config) ToJSON() *ConfigJSON {
 			Invert:           l.Invert,
 			DNS:              stringOrList(l.DNS),
 			DNSMode:          l.DNSMode,
+			QueryTimeout:     durOrEmpty(l.QueryTimeout),
 			DomainFile:       l.DomainFile,
 			DomainURL:        l.DomainURL,
 			Refresh:          l.Refresh.String(),
@@ -248,12 +263,13 @@ func (c *Config) ToJSON() *ConfigJSON {
 	ispGroups := make([]ISPGroupJSON, 0, len(c.ISPGroups))
 	for _, g := range c.ISPGroups {
 		ispGroups = append(ispGroups, ISPGroupJSON{
-			ISP:         string(g.ISP),
-			Enabled:     g.Enabled,
-			SplitRefs:   stringOrList(g.SplitRefs),
-			FallbackDNS: stringOrList(g.FallbackDNS),
-			DNSMode:     g.DNSMode,
-			IPPrefer:    g.IPPrefer,
+			ISP:          string(g.ISP),
+			Enabled:      g.Enabled,
+			SplitRefs:    stringOrList(g.SplitRefs),
+			FallbackDNS:  stringOrList(g.FallbackDNS),
+			DNSMode:      g.DNSMode,
+			QueryTimeout: durOrEmpty(g.QueryTimeout),
+			IPPrefer:     g.IPPrefer,
 			ECS: ECSPolicyJSON{
 				Enabled: g.ECS.Enabled,
 				ISPType: g.ECS.ISPType,
@@ -266,14 +282,15 @@ func (c *Config) ToJSON() *ConfigJSON {
 	customGroups := make([]CustomGroupJSON, 0, len(c.CustomGroups))
 	for _, g := range c.CustomGroups {
 		customGroups = append(customGroups, CustomGroupJSON{
-			Name:        g.Name,
-			Enabled:     g.Enabled,
-			Priority:    g.Priority,
-			Match:       stringOrList(g.Match),
-			SplitRefs:   stringOrList(g.SplitRefs),
-			FallbackDNS: stringOrList(g.FallbackDNS),
-			DNSMode:     g.DNSMode,
-			IPPrefer:    g.IPPrefer,
+			Name:         g.Name,
+			Enabled:      g.Enabled,
+			Priority:     g.Priority,
+			Match:        stringOrList(g.Match),
+			SplitRefs:    stringOrList(g.SplitRefs),
+			FallbackDNS:  stringOrList(g.FallbackDNS),
+			DNSMode:      g.DNSMode,
+			QueryTimeout: durOrEmpty(g.QueryTimeout),
+			IPPrefer:     g.IPPrefer,
 			ECS: ECSPolicyJSON{
 				Enabled: g.ECS.Enabled,
 				ISPType: g.ECS.ISPType,
@@ -290,6 +307,7 @@ func (c *Config) ToJSON() *ConfigJSON {
 		Upstream:            c.Upstream,
 		Timeout:             c.Timeout.String(),
 		ModernTimeout:       c.ModernTimeout.String(),
+		QueryTimeout:        durOrEmpty(c.QueryTimeout),
 		ReplaceCacheTime:    c.ReplaceCacheTime.String(),
 		MaxIPRecords:        c.MaxIPRecords,
 		CNAMERecursionDepth: c.CNAMERecursionDepth,
@@ -406,6 +424,10 @@ func (j *ConfigJSON) ToConfig() (*Config, error) {
 		if err != nil {
 			return nil, fmt.Errorf("split_lists[%d].refresh: %w", i, err)
 		}
+		listQueryTimeout, err := parseDuration(l.QueryTimeout, 0)
+		if err != nil {
+			return nil, fmt.Errorf("split_lists[%d].query_timeout: %w", i, err)
+		}
 		if !ValidIPPrefer(l.IPPrefer) {
 			return nil, fmt.Errorf("split_lists[%d].ip_prefer: 非法取值 %q", i, l.IPPrefer)
 		}
@@ -415,6 +437,7 @@ func (j *ConfigJSON) ToConfig() (*Config, error) {
 			Invert:           l.Invert,
 			DNS:              []string(l.DNS),
 			DNSMode:          l.DNSMode,
+			QueryTimeout:     listQueryTimeout,
 			DomainFile:       l.DomainFile,
 			DomainURL:        l.DomainURL,
 			Refresh:          refresh,
@@ -490,13 +513,18 @@ func (j *ConfigJSON) ToConfig() (*Config, error) {
 		if len(fallback) == 0 && len(g.LegacyDNS) > 0 {
 			fallback = []string(g.LegacyDNS)
 		}
+		groupQueryTimeout, err := parseDuration(g.QueryTimeout, 0)
+		if err != nil {
+			return nil, fmt.Errorf("isp_groups[%d].query_timeout: %w", i, err)
+		}
 		ispGroups = append(ispGroups, ISPGroup{
-			ISP:         key,
-			Enabled:     g.Enabled,
-			SplitRefs:   []string(g.SplitRefs),
-			FallbackDNS: fallback,
-			DNSMode:     g.DNSMode,
-			IPPrefer:    g.IPPrefer,
+			ISP:          key,
+			Enabled:      g.Enabled,
+			SplitRefs:    []string(g.SplitRefs),
+			FallbackDNS:  fallback,
+			DNSMode:      g.DNSMode,
+			QueryTimeout: groupQueryTimeout,
+			IPPrefer:     g.IPPrefer,
 			ECS: ECSPolicy{
 				Enabled: g.ECS.Enabled,
 				ISPType: g.ECS.ISPType,
@@ -512,15 +540,20 @@ func (j *ConfigJSON) ToConfig() (*Config, error) {
 		if len(fallback) == 0 && len(g.LegacyDNS) > 0 {
 			fallback = []string(g.LegacyDNS)
 		}
+		groupQueryTimeout, err := parseDuration(g.QueryTimeout, 0)
+		if err != nil {
+			return nil, fmt.Errorf("custom_groups[%q].query_timeout: %w", g.Name, err)
+		}
 		customGroups = append(customGroups, CustomGroup{
-			Name:        g.Name,
-			Enabled:     g.Enabled,
-			Priority:    g.Priority,
-			Match:       []string(g.Match),
-			SplitRefs:   []string(g.SplitRefs),
-			FallbackDNS: fallback,
-			DNSMode:     g.DNSMode,
-			IPPrefer:    g.IPPrefer,
+			Name:         g.Name,
+			Enabled:      g.Enabled,
+			Priority:     g.Priority,
+			Match:        []string(g.Match),
+			SplitRefs:    []string(g.SplitRefs),
+			FallbackDNS:  fallback,
+			DNSMode:      g.DNSMode,
+			QueryTimeout: groupQueryTimeout,
+			IPPrefer:     g.IPPrefer,
 			ECS: ECSPolicy{
 				Enabled: g.ECS.Enabled,
 				ISPType: g.ECS.ISPType,
@@ -583,6 +616,10 @@ func (j *ConfigJSON) ToConfig() (*Config, error) {
 	}
 	if cfg.ModernTimeout, err = parseDuration(j.ModernTimeout, def.ModernTimeout); err != nil {
 		return nil, fmt.Errorf("modern_timeout: %w", err)
+	}
+	// 总查询超时：缺省/空串＝0＝不限制（保持旧版逐台累加行为）
+	if cfg.QueryTimeout, err = parseDuration(j.QueryTimeout, 0); err != nil {
+		return nil, fmt.Errorf("query_timeout: %w", err)
 	}
 	if cfg.ReplaceCacheTime, err = parseDuration(j.ReplaceCacheTime, def.ReplaceCacheTime); err != nil {
 		return nil, fmt.Errorf("replace_cache_time: %w", err)

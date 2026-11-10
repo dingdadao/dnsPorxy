@@ -18,27 +18,92 @@ import (
 
 // proxyQuery 内部通用查询入口（云替换/CNAME/刷新等链路）：按并发竞速执行并带 BackupDNS 兜底
 func (h *RefactoredHandler) proxyQuery(req *dns.Msg, upstreams []string) (*dns.Msg, error) {
-	resp, _, err := h.queryWithFallback(req, upstreams, config.DNSModeRace)
+	resp, _, err := h.queryWithFallback(req, upstreams, config.DNSModeRace, 0)
 	return resp, err
+}
+
+// errQueryBudgetExceeded 整条查询超过作用域配置的总超时预算
+var errQueryBudgetExceeded = errors.New("query exceeded total timeout budget")
+
+// runWithBudget 给一次上游解析施加硬性总预算：budget<=0 时直接同步执行（历史行为）。
+// 到点即返回 errQueryBudgetExceeded，被放弃的解析 goroutine 会在自己的单台超时内自行结束，
+// 不会写回任何共享状态——这样串行模式也不会再出现「上游数 × 单台超时」的总耗时。
+func runWithBudget(budget time.Duration, onExpire func(), fn func() (upstreamAnswer, error)) (upstreamAnswer, error) {
+	if budget <= 0 {
+		return fn()
+	}
+	done := make(chan upstreamAnswer, 1)
+	go func() {
+		ans, err := fn()
+		if err != nil {
+			ans.err = err
+		}
+		done <- ans
+	}()
+
+	timer := time.NewTimer(budget)
+	defer timer.Stop()
+	select {
+	case ans := <-done:
+		return ans, nil
+	case <-timer.C:
+		if onExpire != nil {
+			onExpire()
+		}
+		return upstreamAnswer{}, errQueryBudgetExceeded
+	}
+}
+
+// upstreamAnswer 一次上游解析的结果载体
+type upstreamAnswer struct {
+	resp   *dns.Msg
+	server string
+	err    error
 }
 
 // queryWithFallback 执行上游查询（按 mode 选择竞速/串行），无有效结果时回退 BackupDNS
 // 第二个返回值是实际给出应答的上游服务器（用于解析日志），失败时为空
-func (h *RefactoredHandler) queryWithFallback(req *dns.Msg, upstreams []string, mode string) (*dns.Msg, string, error) {
+//
+// budget>0 时对「全部上游尝试 + 备份兜底」施加硬性总预算：到点即返回
+// errQueryBudgetExceeded，不再让串行模式的耗时随上游数量线性膨胀（N 台 × 单台超时）。
+// budget=0 保持历史行为（逐台累加、不设总量限制）。
+func (h *RefactoredHandler) queryWithFallback(req *dns.Msg, upstreams []string, mode string, budget time.Duration) (*dns.Msg, string, error) {
 	if len(upstreams) == 0 {
 		return nil, "", errors.New("no upstream servers available")
 	}
 
-	result := h.queryUpstream(req, upstreams, mode)
+	ans, err := runWithBudget(budget, func() {
+		h.Logger.Warn("⏰ [查询超过总超时预算，放弃等待] ", map[string]interface{}{
+			"budget":    budget.String(),
+			"mode":      mode,
+			"upstreams": len(upstreams),
+		})
+	}, func() (upstreamAnswer, error) {
+		resp, server, err := h.resolveUpstream(req, upstreams, mode, budget)
+		return upstreamAnswer{resp: resp, server: server, err: err}, nil
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	return ans.resp, ans.server, ans.err
+}
+
+// resolveUpstream 实际执行上游解析与备份兜底；budget>0 时用于让串行模式提前放弃剩余上游
+func (h *RefactoredHandler) resolveUpstream(req *dns.Msg, upstreams []string, mode string, budget time.Duration) (*dns.Msg, string, error) {
+	start := time.Now()
+	result := h.queryUpstream(req, upstreams, mode, budget)
 
 	// 优先返回有效结果给客户端，如果没有有效结果才返回最快结果
 	if result.HasSuccess && result.SuccessResult != nil && result.SuccessResult.Response != nil {
 		return result.SuccessResult.Response, result.SuccessResult.Server, nil
 	}
 
-	// 没有有效结果，尝试使用备份DNS服务器
-	if resp, ok := h.queryBackupDNS(req); ok {
-		return resp, h.getConfig().BackupDNS, nil
+	// 没有有效结果，尝试使用备份DNS服务器。
+	// 预算已耗尽时不再发起整份备份查询：调用方早已返回，再打一次上游只会浪费 QPS。
+	if budget <= 0 || time.Since(start) < budget {
+		if resp, ok := h.queryBackupDNS(req); ok {
+			return resp, h.getConfig().BackupDNS, nil
+		}
 	}
 
 	// 没有有效结果，返回最快结果（可能是错误）
@@ -78,11 +143,12 @@ func (h *RefactoredHandler) queryBackupDNS(req *dns.Msg) (*dns.Msg, bool) {
 
 // queryUpstream 按解析模式执行上游查询
 // failover/wrandom 仅现代优化器支持（传统优化器为旧格式 host:port 的兼容路径，不支持模式选择）
-func (h *RefactoredHandler) queryUpstream(req *dns.Msg, upstreams []string, mode string) *ConcurrentQueryResult {
+// budget>0 时串行模式会在预算耗尽前停止发起新的上游尝试
+func (h *RefactoredHandler) queryUpstream(req *dns.Msg, upstreams []string, mode string, budget time.Duration) *ConcurrentQueryResult {
 	if modernOptimizer, ok := h.queryOptimizer.(*SimpleModernOptimizer); ok {
 		switch mode {
 		case config.DNSModeFailover:
-			return modernOptimizer.QueryFailover(req, upstreams)
+			return modernOptimizer.queryFailover(req, upstreams, budget)
 		case config.DNSModeWRandom:
 			return modernOptimizer.QueryWeightedRandom(req, upstreams)
 		default:
@@ -109,12 +175,26 @@ type flightOutcome struct {
 // 同一（scope、域名、qtype、模式、上游集合）的并发 miss 由 single-flight 合并为一次回源，
 // 避免「并发冷启动的同一域名各自竞速」把对外请求放大为 客户端数 × 上游数。
 // 第二个返回值是实际给出应答的上游服务器（用于解析日志）
-func (h *RefactoredHandler) proxyQueryWithCaching(req *dns.Msg, upstreams []string, domain string, qtype uint16, mode, scope string) (*dns.Msg, string, error) {
+// budget>0 时合并后的这次回源同样受总预算约束，超时的 leader 会让所有等待者一起拿到
+// errQueryBudgetExceeded，而不是各自拖到 N×单台超时。
+func (h *RefactoredHandler) proxyQueryWithCaching(req *dns.Msg, upstreams []string, domain string, qtype uint16, mode, scope string, budget time.Duration) (*dns.Msg, string, error) {
 	key := fmt.Sprintf("%s|%s|%d|%s|%s", scope, domain, qtype, mode, strings.Join(upstreams, ","))
 
 	v, _, shared := h.upstreamFlight.Do(key, func() (interface{}, error) {
-		resp, server, err := h.doProxyQueryWithCaching(req, upstreams, domain, qtype, mode, scope)
-		return flightOutcome{resp: resp, server: server, err: err}, nil
+		ans, err := runWithBudget(budget, func() {
+			h.Logger.Warn("⏰ [回源超过总超时预算，放弃等待] ", map[string]interface{}{
+				"domain": domain,
+				"budget": budget.String(),
+				"mode":   mode,
+			})
+		}, func() (upstreamAnswer, error) {
+			resp, server, err := h.doProxyQueryWithCaching(req, upstreams, domain, qtype, mode, scope, budget)
+			return upstreamAnswer{resp: resp, server: server, err: err}, nil
+		})
+		if err != nil {
+			return flightOutcome{err: err}, nil
+		}
+		return flightOutcome{resp: ans.resp, server: ans.server, err: ans.err}, nil
 	})
 
 	out := v.(flightOutcome)
@@ -128,7 +208,7 @@ func (h *RefactoredHandler) proxyQueryWithCaching(req *dns.Msg, upstreams []stri
 }
 
 // doProxyQueryWithCaching 执行一次真正的回源查询并缓存结果（由 proxyQueryWithCaching 经单飞行调用）
-func (h *RefactoredHandler) doProxyQueryWithCaching(req *dns.Msg, upstreams []string, domain string, qtype uint16, mode, scope string) (*dns.Msg, string, error) {
+func (h *RefactoredHandler) doProxyQueryWithCaching(req *dns.Msg, upstreams []string, domain string, qtype uint16, mode, scope string, budget time.Duration) (*dns.Msg, string, error) {
 	// 计时上游查询
 	upstreamTimer := h.Logger.StartTimer("upstream_query_detailed")
 
@@ -137,7 +217,7 @@ func (h *RefactoredHandler) doProxyQueryWithCaching(req *dns.Msg, upstreams []st
 		return nil, "", errors.New("no upstream servers available")
 	}
 
-	result := h.queryUpstream(req, upstreams, mode)
+	result := h.queryUpstream(req, upstreams, mode, budget)
 
 	// 获取上游查询时间
 	upstreamTime := upstreamTimer.End()
@@ -157,7 +237,11 @@ func (h *RefactoredHandler) doProxyQueryWithCaching(req *dns.Msg, upstreams []st
 		return resp, result.SuccessResult.Server, nil
 	}
 
-	// 上游（含分流列表 DNS）全部失败时回退 BackupDNS，与非IP记录路径保持一致
+	// 上游（含分流列表 DNS）全部失败时回退 BackupDNS，与非IP记录路径保持一致。
+	// 预算已耗尽时同样跳过：调用方已按超时返回，再发整份备份查询只浪费 QPS。
+	if budget > 0 && upstreamTime >= budget {
+		return nil, "", errQueryBudgetExceeded
+	}
 	if resp, ok := h.queryBackupDNS(req); ok {
 		if resp.Rcode == dns.RcodeSuccess {
 			h.cacheManager.SetScoped(scope, domain, qtype, resp, false)

@@ -521,6 +521,12 @@ func (qo *SimpleModernOptimizer) concurrentQuery(req *dns.Msg, upstreams []strin
 // QueryFailover 串行故障转移：按上游顺序逐个查询，第一个成功（NOERROR）即返回，
 // 前一台失败/超时才用下一台。用于分流列表选择 failover 模式时，避免把上游 QPS 放大 N 倍。
 func (qo *SimpleModernOptimizer) QueryFailover(req *dns.Msg, upstreams []string) *ConcurrentQueryResult {
+	return qo.queryFailover(req, upstreams, 0)
+}
+
+// queryFailover 串行模式的实现。budget>0 时整次串行尝试受总预算约束：
+// 每发起一台之前先看剩余时间，已耗尽就不再发新请求，避免总耗时按「上游数 × 单台超时」膨胀。
+func (qo *SimpleModernOptimizer) queryFailover(req *dns.Msg, upstreams []string, budget time.Duration) *ConcurrentQueryResult {
 	start := time.Now()
 
 	validUpstreams := qo.filterValidUpstreams(upstreams)
@@ -537,6 +543,16 @@ func (qo *SimpleModernOptimizer) QueryFailover(req *dns.Msg, upstreams []string)
 	var last *QueryResult
 
 	for i, server := range validUpstreams {
+		// 预算耗尽：不再发起新的上游请求，直接把已收集的结果交回调用方
+		if budget > 0 && time.Since(start) >= budget {
+			qo.logger.Debug("⏰ 串行模式总预算耗尽，提前结束", map[string]interface{}{
+				"budget":     budget.String(),
+				"attempted":  len(allResults),
+				"total":      len(validUpstreams),
+				"total_time": time.Since(start).String(),
+			})
+			break
+		}
 		result := qo.queryServer(req, server)
 		if result == nil {
 			continue
@@ -692,24 +708,42 @@ func (qo *SimpleModernOptimizer) QueryWeightedRandom(req *dns.Msg, upstreams []s
 		attempts = len(weighted)
 	}
 
-	// 按权重无放回地预先确定尝试顺序，保证对冲时不会重复选中同一台上游
+	// 按权重无放回地预先确定尝试顺序；同一地址重复出现时只保留第一次，
+	// 避免对冲把两次查询打到同一台上游（UDP 连接池的 SingleInflight 还会把两次合并）。
+	// order 最多 2 台，用切片比较去重，避免热路径上多分配一个 map。
 	remaining := make([]weightedUpstream, len(weighted))
 	copy(remaining, weighted)
 	order := make([]weightedUpstream, 0, attempts)
-	for i := 0; i < attempts; i++ {
+	for len(order) < attempts && len(remaining) > 0 {
 		idx := pick(remaining, rnd)
-		order = append(order, remaining[idx])
+		choice := remaining[idx]
 		remaining = append(remaining[:idx], remaining[idx+1:]...)
+		dup := false
+		for _, picked := range order {
+			if picked.server == choice.server {
+				dup = true
+				break
+			}
+		}
+		if dup {
+			continue
+		}
+		order = append(order, choice)
 	}
 
 	type wrandAttempt struct {
-		choice weightedUpstream
-		result *QueryResult
+		choice  weightedUpstream
+		attempt int // 第几次尝试（1 起），对冲成功时 len(allResults) 不能代表尝试序号
+		result  *QueryResult
 	}
 	resultChan := make(chan wrandAttempt, len(order))
 	launch := func(i int) {
 		go func() {
-			resultChan <- wrandAttempt{choice: order[i], result: qo.queryServer(req, order[i].server)}
+			resultChan <- wrandAttempt{
+				choice:  order[i],
+				attempt: i + 1,
+				result:  qo.queryServer(req, order[i].server),
+			}
 		}()
 	}
 
@@ -717,6 +751,7 @@ func (qo *SimpleModernOptimizer) QueryWeightedRandom(req *dns.Msg, upstreams []s
 	launched := 1
 	pending := 1
 
+	// 一次性 timer 足够：maxAttempts=2 只会对冲一次；若以后放宽上限，需要在这里 Reset
 	hedge := time.NewTimer(wrandomHedgeDelay)
 	defer hedge.Stop()
 
@@ -732,9 +767,9 @@ func (qo *SimpleModernOptimizer) QueryWeightedRandom(req *dns.Msg, upstreams []s
 			// 首选迟迟无应答：立刻并行发起下一台，谁先给出有效应答就用谁
 			if launched < len(order) {
 				qo.logger.Debug("⏱️ 权重随机模式触发上游对冲", map[string]interface{}{
-					"slow_server": order[launched-1].server,
+					"slow_server":  order[launched-1].server,
 					"hedge_server": order[launched].server,
-					"hedge_delay": wrandomHedgeDelay.String(),
+					"hedge_delay":  wrandomHedgeDelay.String(),
 				})
 				launch(launched)
 				launched++
@@ -757,7 +792,7 @@ func (qo *SimpleModernOptimizer) QueryWeightedRandom(req *dns.Msg, upstreams []s
 			qo.logger.Debug("✅ 权重随机模式查询成功", map[string]interface{}{
 				"server":       done.choice.server,
 				"weight":       done.choice.weight,
-				"attempt":      len(allResults),
+				"attempt":      done.attempt,
 				"time":         result.ResponseTime.String(),
 				"total_time":   time.Since(start).String(),
 				"answer_count": len(result.Response.Answer),
@@ -777,7 +812,7 @@ func (qo *SimpleModernOptimizer) QueryWeightedRandom(req *dns.Msg, upstreams []s
 		if launched < len(order) {
 			qo.logger.Debug("⏭️ 权重随机模式当前上游未成功，尝试回退", map[string]interface{}{
 				"server":  done.choice.server,
-				"attempt": len(allResults),
+				"attempt": done.attempt,
 				"error":   result.Error,
 			})
 			launch(launched)

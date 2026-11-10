@@ -86,7 +86,7 @@ func (h *RefactoredHandler) hasARecord(domain string, d SplitDecision, scope str
 
 	req := &dns.Msg{}
 	req.SetQuestion(dns.Fqdn(domain), dns.TypeA)
-	resp, server, err := h.proxyQueryWithCaching(applySplitECS(req, d), h.upstreamsFor(domain, d), domain, dns.TypeA, d.DNSMode, scope)
+	resp, server, err := h.proxyQueryWithCaching(applySplitECS(req, d), h.upstreamsFor(domain, d), domain, dns.TypeA, d.DNSMode, scope, d.QueryTimeout)
 	if err != nil {
 		h.Logger.Debug("⚠️ [A/AAAA 偏好判定补查 A 失败，放行 AAAA] ", map[string]interface{}{
 			"rule":   "IP_PREFER_LOOKUP_A_FAILED",

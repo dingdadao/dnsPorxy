@@ -33,6 +33,22 @@ type ReplaceContext struct {
 	Route     SplitDecision // 主查询的分流决策：命中列表按列表 ECS 策略，未命中透传客户端自带 ECS
 	Upstreams []string      // 主查询实际使用的上游（命中列表 DNS / 分组兜底 DNS / 全局），为空时回退全局
 	DNSMode   string        // 主查询的解析模式，替换域名沿用同一模式
+	// Deadline 主查询总超时预算的截止时间：替换回源只使用「剩余」预算，
+	// 否则「主查询一份预算 + 替换域名一份预算」会让单次请求最坏耗时翻倍。
+	// 零值表示主查询未配置总超时预算，替换回源同样不限制。
+	Deadline time.Time
+}
+
+// remainingBudget 主查询总预算的剩余部分；Deadline 为零（未配置总预算）时返回 0＝不限制。
+// 预算已耗尽时返回极小正值，让下层立即按超时处理，而不是再放行一整份预算。
+func (c ReplaceContext) remainingBudget() time.Duration {
+	if c.Deadline.IsZero() {
+		return 0
+	}
+	if d := time.Until(c.Deadline); d > 0 {
+		return d
+	}
+	return time.Nanosecond
 }
 
 // cacheScope 替换域名缓存的隔离标识。
@@ -64,7 +80,7 @@ type CloudHandler struct {
 	respond       func(dns.ResponseWriter, *dns.Msg, *dns.Msg) // 统一响应出口（保证EDNS/TC处理一致）
 	// queryWithMode 按解析模式执行的上游查询（race/failover/wrandom），
 	// 用于让替换域名回源与主查询走同一套模式；未注入时退回 proxyQuery（竞速）
-	queryWithMode func(*dns.Msg, []string, string) (*dns.Msg, error)
+	queryWithMode func(*dns.Msg, []string, string, time.Duration) (*dns.Msg, error)
 
 	apiMu      sync.RWMutex                 // 保护 apiClients
 	apiClients map[string]*ReplaceAPIClient // 按 (url,count) 索引的 CF 替换接口客户端
@@ -78,9 +94,10 @@ func (ch *CloudHandler) getConfig() *config.Config {
 }
 
 // replaceQuery 替换域名回源：按主查询的解析模式执行（未注入模式感知函数时退回竞速）
-func (ch *CloudHandler) replaceQuery(req *dns.Msg, upstreams []string, mode string) (*dns.Msg, error) {
+// budget 沿用主查询的总超时预算，避免替换这一跳把整体耗时再翻一倍
+func (ch *CloudHandler) replaceQuery(req *dns.Msg, upstreams []string, mode string, budget time.Duration) (*dns.Msg, error) {
 	if ch.queryWithMode != nil && mode != "" {
-		return ch.queryWithMode(req, upstreams, mode)
+		return ch.queryWithMode(req, upstreams, mode, budget)
 	}
 	return ch.proxyQuery(req, upstreams)
 }
@@ -350,7 +367,7 @@ func (ch *CloudHandler) ResolveReplaceIPs(reqID uint16, domain string, qtype uin
 	replaceResp, hit, _, _ := ch.cacheManager.GetScoped(cacheScope, replaceDomain, qtype)
 	if !hit {
 		var err error
-		replaceResp, err = ch.replaceQuery(replaceReq, upstreams, ctx.DNSMode)
+		replaceResp, err = ch.replaceQuery(replaceReq, upstreams, ctx.DNSMode, ctx.remainingBudget())
 		// 无应答或上游返回非成功rcode时也要给出可读原因（err为nil时不能直接 %w）
 		if err == nil && (replaceResp == nil || replaceResp.Rcode != dns.RcodeSuccess) {
 			why := "no response"
@@ -1626,7 +1643,7 @@ func (ch *CloudHandler) extractFinalIPs(resp *dns.Msg, originalDomain string, up
 			queryResp = cachedResp
 		} else {
 			// 如果缓存中没有，执行查询（沿用主查询的上游与解析模式）
-			queryResp, err = ch.replaceQuery(queryReq, upstreams, ctx.DNSMode)
+			queryResp, err = ch.replaceQuery(queryReq, upstreams, ctx.DNSMode, ctx.remainingBudget())
 			if err == nil && queryResp != nil && queryResp.Rcode == dns.RcodeSuccess {
 				// 将查询结果缓存
 				ch.cacheManager.SetScoped(cacheScope, target, resp.Question[0].Qtype, queryResp, false)

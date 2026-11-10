@@ -94,6 +94,9 @@ type Entry struct {
 	Rcode      string `json:"rcode"`
 	Answers    string `json:"answers"` // 应答记录摘要
 	ElapsedMS  int64  `json:"elapsed_ms"`
+	// BudgetMS 本次查询实际生效的「总查询超时」预算（毫秒）。
+	// 0 表示该作用域未配置总预算，统计时退回全局阈值判定超时。
+	BudgetMS int64 `json:"budget_ms"`
 }
 
 // GroupStat 单维度聚合结果（来源 / 类型 / 结果分布）
@@ -263,7 +266,8 @@ CREATE TABLE IF NOT EXISTS query_logs (
 	ecs           TEXT NOT NULL DEFAULT '',
 	rcode         TEXT NOT NULL DEFAULT '',
 	answers       TEXT NOT NULL DEFAULT '',
-	elapsed_ms    INTEGER NOT NULL DEFAULT 0
+	elapsed_ms    INTEGER NOT NULL DEFAULT 0,
+	budget_ms     INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_query_logs_ts ON query_logs(ts);
 CREATE INDEX IF NOT EXISTS idx_query_logs_domain ON query_logs(domain);
@@ -279,6 +283,7 @@ CREATE INDEX IF NOT EXISTS idx_query_logs_domain ON query_logs(domain);
 		`ALTER TABLE query_logs ADD COLUMN source_kind TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE query_logs ADD COLUMN via TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE query_logs ADD COLUMN client_ip_num INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE query_logs ADD COLUMN budget_ms INTEGER NOT NULL DEFAULT 0`,
 	} {
 		if _, err := s.db.Exec(ddl); err != nil && !strings.Contains(err.Error(), "duplicate column") {
 			return fmt.Errorf("迁移解析日志表结构失败: %w", err)
@@ -517,10 +522,13 @@ func (s *Store) Summary(f Filter, topN int, timeoutMS int64) (*Summary, error) {
 	}
 	bargs := append([]interface{}{thr, thr, thr}, args...)
 
+	// 超时口径：优先用该条记录实际生效的「总查询超时」预算（budget_ms），
+	// 未配置总预算的老记录（budget_ms=0）再退回全局阈值。
+	// 这样串行模式试过多台上游、但每台都在自己的超时内应答的查询，不会被误判成超时。
 	if err := s.db.QueryRow(`SELECT COUNT(*), COALESCE(MIN(ts),0), COALESCE(MAX(ts),0),
-		COALESCE(AVG(CASE WHEN elapsed_ms < ? THEN elapsed_ms END),0), COUNT(DISTINCT domain),
-		COALESCE(SUM(CASE WHEN elapsed_ms >= ? THEN 1 ELSE 0 END),0),
-		COALESCE(AVG(CASE WHEN elapsed_ms >= ? THEN elapsed_ms END),0) FROM query_logs`+where, bargs...).
+		COALESCE(AVG(CASE WHEN elapsed_ms < `+sqlBudgetExpr+` THEN elapsed_ms END),0), COUNT(DISTINCT domain),
+		COALESCE(SUM(CASE WHEN elapsed_ms >= `+sqlBudgetExpr+` THEN 1 ELSE 0 END),0),
+		COALESCE(AVG(CASE WHEN elapsed_ms >= `+sqlBudgetExpr+` THEN elapsed_ms END),0) FROM query_logs`+where, bargs...).
 		Scan(&sum.Total, &sum.FirstTS, &sum.LastTS, &sum.AvgElapsedMS, &sum.Domains,
 			&sum.Timeouts, &sum.TimeoutAvgElapsedMS); err != nil {
 		return nil, fmt.Errorf("统计汇总失败: %w", err)
@@ -563,10 +571,17 @@ func (s *Store) Summary(f Filter, topN int, timeoutMS int64) (*Summary, error) {
 	return sum, nil
 }
 
+// sqlBudgetExpr 「该条记录实际生效的总查询超时预算」SQL 片段。
+// budget_ms=0 的老记录退回调用方传入的全局阈值，保证历史数据口径不变。
+const sqlBudgetExpr = "(CASE WHEN budget_ms > 0 THEN budget_ms ELSE ? END)"
+
+// sqlBudgetExprQ 同上，供带表别名 q 的查询使用
+const sqlBudgetExprQ = "(CASE WHEN q.budget_ms > 0 THEN q.budget_ms ELSE ? END)"
+
 // groupStats 按列聚合次数与平均耗时（col 仅由内部常量传入，不存在注入）
-// 次数为全量，平均耗时剔除超时记录（elapsed_ms >= thr）
+// 次数为全量，平均耗时剔除超时记录（elapsed_ms >= 该条生效预算）
 func (s *Store) groupStats(col, where string, args []interface{}, thr int64) ([]GroupStat, error) {
-	rows, err := s.db.Query(`SELECT `+col+`, COUNT(*), COALESCE(AVG(CASE WHEN elapsed_ms < ? THEN elapsed_ms END),0)
+	rows, err := s.db.Query(`SELECT `+col+`, COUNT(*), COALESCE(AVG(CASE WHEN elapsed_ms < `+sqlBudgetExpr+` THEN elapsed_ms END),0)
 		FROM query_logs`+where+` GROUP BY `+col+` ORDER BY COUNT(*) DESC, `+col+` ASC`,
 		append([]interface{}{thr}, args...)...)
 	if err != nil {
@@ -594,8 +609,8 @@ func (s *Store) listStats(where string, args []interface{}, thr int64) ([]ListSt
 		where += " AND list_name <> ''"
 	}
 	rows, err := s.db.Query(`SELECT list_name, action, COUNT(*),
-		COALESCE(SUM(CASE WHEN elapsed_ms < ? THEN elapsed_ms END),0),
-		COALESCE(SUM(CASE WHEN elapsed_ms < ? THEN 1 ELSE 0 END),0)
+		COALESCE(SUM(CASE WHEN elapsed_ms < `+sqlBudgetExpr+` THEN elapsed_ms END),0),
+		COALESCE(SUM(CASE WHEN elapsed_ms < `+sqlBudgetExpr+` THEN 1 ELSE 0 END),0)
 		FROM query_logs`+where+` GROUP BY list_name, action`,
 		append([]interface{}{thr, thr}, args...)...)
 	if err != nil {
@@ -659,7 +674,7 @@ func (s *Store) topDomains(where string, args []interface{}, topN int, thr int64
 	qargs := append(append([]interface{}{thr}, args...), topN)
 
 	rows, err := s.db.Query(`SELECT q.domain, COUNT(*),
-		COALESCE(AVG(CASE WHEN q.elapsed_ms < ? THEN q.elapsed_ms END),0),
+		COALESCE(AVG(CASE WHEN q.elapsed_ms < `+sqlBudgetExprQ+` THEN q.elapsed_ms END),0),
 		(SELECT action FROM query_logs x WHERE x.domain = q.domain
 			GROUP BY action ORDER BY COUNT(*) DESC, action ASC LIMIT 1),
 		(SELECT list_name FROM query_logs y WHERE y.domain = q.domain AND list_name <> ''
@@ -702,7 +717,7 @@ func (s *Store) clientStats(where string, args []interface{}, topN int, thr int6
 	qargs := append(append([]interface{}{thr}, args...), topN)
 
 	rows, err := s.db.Query(`SELECT q.client, MAX(q.client_isp), MAX(q.source_kind), COUNT(*),
-		COALESCE(AVG(CASE WHEN q.elapsed_ms < ? THEN q.elapsed_ms END),0),
+		COALESCE(AVG(CASE WHEN q.elapsed_ms < `+sqlBudgetExprQ+` THEN q.elapsed_ms END),0),
 		(SELECT action FROM query_logs x WHERE x.client = q.client
 			GROUP BY action ORDER BY COUNT(*) DESC, action ASC LIMIT 1)
 		FROM query_logs q`+where+` GROUP BY q.client ORDER BY COUNT(*) DESC, q.client ASC LIMIT ?`, qargs...)
@@ -824,8 +839,8 @@ func (s *Store) insertBatch(batch []Entry) error {
 	if err != nil {
 		return err
 	}
-	stmt, err := tx.Prepare(`INSERT INTO query_logs(ts, domain, qtype, client, client_isp, protocol, source_kind, via, client_ip_num, action, list_name, dns, dns_mode, ecs, rcode, answers, elapsed_ms)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	stmt, err := tx.Prepare(`INSERT INTO query_logs(ts, domain, qtype, client, client_isp, protocol, source_kind, via, client_ip_num, action, list_name, dns, dns_mode, ecs, rcode, answers, elapsed_ms, budget_ms)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		tx.Rollback()
 		return err
@@ -835,7 +850,7 @@ func (s *Store) insertBatch(batch []Entry) error {
 	for _, e := range batch {
 		if _, err := stmt.Exec(e.Time, e.Domain, e.QType, e.Client, e.ClientISP,
 			e.Protocol, e.SourceKind, e.Via, clientIPNum(e.Client), e.Action,
-			e.ListName, e.DNS, e.DNSMode, e.ECS, e.Rcode, e.Answers, e.ElapsedMS); err != nil {
+			e.ListName, e.DNS, e.DNSMode, e.ECS, e.Rcode, e.Answers, e.ElapsedMS, e.BudgetMS); err != nil {
 			tx.Rollback()
 			return err
 		}

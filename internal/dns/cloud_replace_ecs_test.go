@@ -5,6 +5,7 @@ import (
 	"net"
 	"sync"
 	"testing"
+	"time"
 
 	"dnsPorxy/internal/config"
 	"dnsPorxy/internal/utils"
@@ -187,7 +188,7 @@ func TestReplaceDomainQueryUsesLineUpstreams(t *testing.T) {
 	ch := newReplaceECSTestHandler(t, "cf.example.com", func(*dns.Msg, []string) (*dns.Msg, error) {
 		return nil, errors.New("替换域名不应走全局上游")
 	})
-	ch.queryWithMode = func(req *dns.Msg, upstreams []string, mode string) (*dns.Msg, error) {
+	ch.queryWithMode = func(req *dns.Msg, upstreams []string, mode string, _ time.Duration) (*dns.Msg, error) {
 		mu.Lock()
 		calls = append(calls, call{upstream: upstreams[0], mode: mode})
 		mu.Unlock()

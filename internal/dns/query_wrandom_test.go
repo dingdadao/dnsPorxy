@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -95,7 +96,7 @@ func TestPickWeightedIndexDistribution(t *testing.T) {
 	})
 }
 
-// 权重随机每次 miss 只发 1 次：首选成功即不再联系其它上游
+// 首选成功时每次 miss 只发 1 次：首选成功即不再联系其它上游
 func TestQueryWeightedRandomSendsSingleUpstream(t *testing.T) {
 	logger := utils.NewEnhancedLogger("error", "test", false)
 	req := new(dns.Msg)
@@ -150,6 +151,45 @@ func TestQueryWeightedRandomRetriesOnceOnFailure(t *testing.T) {
 	}
 	if len(servers) != 2 {
 		t.Errorf("两次尝试应为不同上游，实际命中 %+v", servers)
+	}
+}
+
+// 同一地址重复配置时只保留一台，避免对冲把两次查询打到同一台上游
+func TestQueryWeightedRandomDeduplicatesUpstreams(t *testing.T) {
+	logger := utils.NewEnhancedLogger("error", "test", false)
+	req := new(dns.Msg)
+	req.SetQuestion("a.example.com.", dns.TypeA)
+
+	var mu sync.Mutex
+	calls := make(map[string]int)
+	qo := NewSimpleModernOptimizer(logger, 2*time.Second)
+	t.Cleanup(qo.Close)
+	// 固定每次选第一台，让重复地址成为首选
+	qo.pickIndex = func(_ []weightedUpstream, _ *rand.Rand) int { return 0 }
+	qo.udpQueryFunc = func(_ *dns.Msg, server string) (*dns.Msg, error) {
+		mu.Lock()
+		calls[server]++
+		mu.Unlock()
+		if server == "udp://same.example:53" {
+			return nil, errors.New("mock query failed")
+		}
+		return wrandomOKResp(req), nil
+	}
+
+	res := qo.QueryWeightedRandom(req, []string{
+		"udp://same.example:53", "udp://same.example:53", "udp://other.example:53",
+	})
+	if !res.HasSuccess || res.SuccessResult == nil || res.SuccessResult.Server != "udp://other.example:53" {
+		t.Fatalf("重复上游去重后应回退到另一台并成功: %+v", res)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if calls["udp://same.example:53"] != 1 {
+		t.Errorf("同一上游不应被重复发起，实际 %d 次", calls["udp://same.example:53"])
+	}
+	if calls["udp://other.example:53"] != 1 {
+		t.Errorf("次选应命中另一台且只发 1 次，实际 %d 次", calls["udp://other.example:53"])
 	}
 }
 

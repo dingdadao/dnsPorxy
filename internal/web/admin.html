@@ -506,13 +506,15 @@ const SECTIONS = [
         help:"按顺序查询；支持 udp:// tcp:// https://(DoH) tls://(DoT) h3://(DoH3)，至少保留一个。未写端口时按协议自动补默认端口（udp/tcp→53、tls→853、https/h3→443），保存后即按补全结果落库。可在地址末尾加 #权重（如 udp://1.1.1.1:53#70）供「权重随机」模式使用" },
       { id:"timeout", label:"传统协议超时（UDP/TCP）", type:"duration", placeholder:"1.5s" },
       { id:"modern_timeout", label:"现代协议超时（DoH/DoT/DoH3）", type:"duration", placeholder:"1s" },
+      { id:"query_timeout", label:"总查询超时（整条查询，全局默认）", type:"duration", placeholder:"留空=不限制",
+        help:"上面两项是「单台上游」超时，本项是「整条查询」的总预算，覆盖全部上游尝试与备用 DNS 兜底。串行(failover)模式若不设总预算，总耗时按「上游数 × 单台超时」累加（如 6 台 × 1.5s ≈ 9s），这正是日志里耗时远超配置值的原因。留空＝不限制（旧行为）。可在分流列表、客户端分组里按作用域单独覆盖。" },
       { id:"backup_dns", label:"备用 DNS", type:"text", mono:true, span2:true,
         help:"所有上游均失败后的兜底解析器；未写端口按 udp 默认补 :53" },
       { id:"dns_mode", label:"默认解析模式", type:"select", span2:true, options:[
         { v:"race", label:"并发竞速：同时查询全部上游，取最快成功的结果（默认）" },
         { v:"failover", label:"串行故障转移：按顺序依次查询，前一个失败/超时才用下一个" },
-        { v:"wrandom", label:"权重随机：按地址 #权重 随机选一台查询（每次回源只发 1 次），失败再从其余选一台" },
-      ], help:"作用于既未命中域名分流列表、客户端分组也未命中兜底的域名。竞速模式每次回源会对全部上游并发（对外请求量≈上游数）；权重随机模式每次只发 1 次，最省上游。可在分流列表 / 客户端分组里单独覆盖。上游地址加 #权重（如 udp://1.1.1.1:53#70）时数值越大被选中的比例越高；无 #权重 视为等权，#0 表示禁用。" },
+        { v:"wrandom", label:"权重随机：按地址 #权重 随机选一台查询（通常只发 1 次，首选慢时会并行补发 1 次），失败再从其余选一台" },
+      ], help:"作用于既未命中域名分流列表、客户端分组也未命中兜底的域名。竞速模式每次回源会对全部上游并发（对外请求量≈上游数）；权重随机模式通常每次只发 1 次，最省上游；首选超过约 100ms 仍未应答时会并行补发一次次选，取先到的有效应答。可在分流列表 / 客户端分组里单独覆盖。上游地址加 #权重（如 udp://1.1.1.1:53#70）时数值越大被选中的比例越高；无 #权重 视为等权，#0 表示禁用。" },
     ]},
     { title:"域名分流列表", body:[
       { id:"split_lists", label:"分流列表", type:"splitlist", span2:true,
@@ -674,7 +676,7 @@ function humanDur(s) {
   return String(+(ms/1000).toFixed(3)) + "s";
 }
 function humanizeConfig(c) {
-  const durs = ["timeout","modern_timeout","replace_cache_time","network_refresh","doh3_quic_max_idle","doh3_quic_keepalive"];
+  const durs = ["timeout","modern_timeout","query_timeout","replace_cache_time","network_refresh","doh3_quic_max_idle","doh3_quic_keepalive"];
   durs.forEach(k => { if (c[k]) c[k] = humanDur(c[k]); });
   if (c.cache && c.cache.ttl) c.cache.ttl = humanDur(c.cache.ttl);
   if (c.cache && c.cache.stale_ttl) c.cache.stale_ttl = humanDur(c.cache.stale_ttl);
@@ -684,6 +686,8 @@ function humanizeConfig(c) {
   c.dns_mode = String(c.dns_mode || "").trim() || "race";
   c.split_lists.forEach(l => {
     if (l.refresh) l.refresh = humanDur(l.refresh);
+    /* query_timeout 空值＝不单独配置（跟随全局） */
+    if (l.query_timeout) l.query_timeout = humanDur(l.query_timeout);
     /* dns 兼容旧的单字符串写法，统一归一化为数组 */
     if (!Array.isArray(l.dns)) l.dns = (l.dns == null || l.dns === "") ? [] : [l.dns];
     /* dns_mode 空值按默认「并发竞速」归一化 */
@@ -994,8 +998,10 @@ function splitListEditorHTML(items) {
         ${field("dns_mode", "多 DNS 解析模式", { span2:true, def:"race", select:[
           { v:"race", label:"并发竞速：同时查询全部 DNS，取最快成功的结果（默认）" },
           { v:"failover", label:"串行故障转移：按上面顺序依次查询，前一个失败/超时才用下一个" },
-          { v:"wrandom", label:"权重随机：按地址 #权重 随机选一台查询（每次回源只发 1 次）" },
-        ], help:"仅当本列表配置了多个 DNS 时生效；串行/权重随机模式的上游查询量最小（权重随机每次只发 1 次），竞速则会对全部 DNS 并发。DNS 地址可加 #权重（如 udp://1.1.1.1:53#70），无 #权重 视为等权，#0 表示禁用" })}
+          { v:"wrandom", label:"权重随机：按地址 #权重 随机选一台查询（通常只发 1 次，首选慢时并行补发 1 次）" },
+        ], help:"仅当本列表配置了多个 DNS 时生效；串行/权重随机模式的上游查询量最小（权重随机通常每次只发 1 次，首选慢时并行补发 1 次），竞速则会对全部 DNS 并发。DNS 地址可加 #权重（如 udp://1.1.1.1:53#70），无 #权重 视为等权，#0 表示禁用" })}
+        ${field("query_timeout", "总查询超时（整条查询）", { ph:"留空=跟随全局",
+          help:"本列表的总预算，覆盖全部上游尝试与备用 DNS 兜底。留空则沿用引用本列表的分组配置，再退到全局「总查询超时」。串行模式下不设此项时，总耗时仍按「DNS 数量 × 单台超时」累加。" })}
         ${field("ip_prefer", "A/AAAA 解析偏好", { span2:true, select:[
           { v:"", label:"跟随全局默认（在「常规服务」里配置）" },
           { v:"prefer_a", label:"优先A：客户端查 AAAA 时，若域名有 A 记录则返回空结果" },
@@ -1175,8 +1181,15 @@ function dnsModeSelect(kind, i, cur) {
   return `<select data-cg-kind="${kind}" data-cg-idx="${i}" data-cg-field="dns_mode">
     <option value="race"${v === "race" ? " selected" : ""}>并发竞速：同时查询全部 DNS，取最快成功的结果（默认）</option>
     <option value="failover"${v === "failover" ? " selected" : ""}>串行故障转移：按顺序依次查询，前一个失败/超时才用下一个</option>
-    <option value="wrandom"${v === "wrandom" ? " selected" : ""}>权重随机：按地址 #权重 随机选一台查询（每次回源只发 1 次）</option>
+    <option value="wrandom"${v === "wrandom" ? " selected" : ""}>权重随机：按地址 #权重 随机选一台查询（通常只发 1 次，首选慢时并行补发 1 次）</option>
   </select>`;
+}
+
+/* 分组「总查询超时」输入框：留空＝跟随全局默认 */
+function queryTimeoutInput(kind, i, cur) {
+  return `<input type="text" class="mono" value="${esc(String(cur || "").trim())}"
+    data-cg-kind="${kind}" data-cg-idx="${i}" data-cg-field="query_timeout"
+    placeholder="留空=跟随全局（如 3s）">`;
 }
 
 /* 分组「引用分流列表」编辑器：可搜索勾选式下拉多选。
@@ -1329,7 +1342,9 @@ function ispGroupEditorHTML(items) {
         ${grpField(i, "isp", "fallback_dns", "覆盖上游 DNS（分流未命中时用）", dnsListHTML("isp", i, g.fallback_dns),
           "引用分流全部未命中时，用这里的 DNS 解析并覆盖全局上游；留空则回退全局上游。")}
         ${grpField(i, "isp", "dns_mode", "兜底 DNS 解析模式", dnsModeSelect("isp", i, g.dns_mode),
-          "同时查询全部 DNS 取最快成功（race）、按顺序取第一个成功（failover），或按 #权重 随机选一台（wrandom，每次回源只发 1 次）。")}
+          "同时查询全部 DNS 取最快成功（race）、按顺序取第一个成功（failover），或按 #权重 随机选一台（wrandom，通常每次回源只发 1 次，首选慢时并行补发 1 次）。")}
+        ${grpField(i, "isp", "query_timeout", "总查询超时（整条查询）", queryTimeoutInput("isp", i, g.query_timeout),
+          "本组兜底查询的总预算，覆盖全部上游尝试与备用 DNS 兜底；留空则跟随全局。串行模式下不设此项时，总耗时按「DNS 数量 × 单台超时」累加。")}
         ${grpField(i, "isp", "ip_prefer", "解析偏好（A/AAAA）", ipPreferSelect("isp", i, g.ip_prefer),
           "只影响本分组兜底查询；引用分流命中时以该分流列表的偏好为准。")}
       </div>
@@ -1375,7 +1390,9 @@ function customGroupEditorHTML(items) {
         ${grpField(i, "custom", "fallback_dns", "覆盖上游 DNS（分流未命中时用）", dnsListHTML("custom", i, g.fallback_dns),
           "引用分流全部未命中时，用这里的 DNS 解析并覆盖全局上游；留空则回退全局上游。")}
         ${grpField(i, "custom", "dns_mode", "兜底 DNS 解析模式", dnsModeSelect("custom", i, g.dns_mode),
-          "同时查询全部 DNS 取最快成功（race）、按顺序取第一个成功（failover），或按 #权重 随机选一台（wrandom，每次回源只发 1 次）。")}
+          "同时查询全部 DNS 取最快成功（race）、按顺序取第一个成功（failover），或按 #权重 随机选一台（wrandom，通常每次回源只发 1 次，首选慢时并行补发 1 次）。")}
+        ${grpField(i, "custom", "query_timeout", "总查询超时（整条查询）", queryTimeoutInput("custom", i, g.query_timeout),
+          "本组兜底查询的总预算，覆盖全部上游尝试与备用 DNS 兜底；留空则跟随全局。串行模式下不设此项时，总耗时按「DNS 数量 × 单台超时」累加。")}
         ${grpField(i, "custom", "ip_prefer", "解析偏好（A/AAAA）", ipPreferSelect("custom", i, g.ip_prefer),
           "只影响本分组兜底查询；引用分流命中时以该分流列表的偏好为准。")}
       </div>

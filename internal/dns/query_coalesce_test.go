@@ -59,7 +59,7 @@ func TestProxyQueryWithCachingCoalescesConcurrentMiss(t *testing.T) {
 			req := new(dns.Msg)
 			req.SetQuestion("coalesce.example.com.", dns.TypeA)
 			<-start // 对齐启动，确保全部进入同一飞行
-			resp, _, err := h.proxyQueryWithCaching(req, upstreams, "coalesce.example.com", dns.TypeA, config.DNSModeRace, "-")
+			resp, _, err := h.proxyQueryWithCaching(req, upstreams, "coalesce.example.com", dns.TypeA, config.DNSModeRace, "-", 0)
 			if err != nil {
 				t.Errorf("goroutine %d 查询失败: %v", i, err)
 				return

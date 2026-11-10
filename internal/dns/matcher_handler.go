@@ -3,6 +3,7 @@ package dns
 import (
 	"os"
 	"sync"
+	"time"
 
 	"dnsPorxy/internal/config"
 	"dnsPorxy/internal/utils"
@@ -132,6 +133,7 @@ type SplitDecision struct {
 	Matched          bool
 	DNS              []string
 	DNSMode          string
+	QueryTimeout     time.Duration // 列表级总查询超时预算（0=由调用方回退全局默认）
 	ListName         string
 	EnableCloudCheck bool
 	ECS              config.ECSPolicy
@@ -216,6 +218,7 @@ func splitDecisionFrom(l config.SplitList, dns []string) SplitDecision {
 		Matched:          true,
 		DNS:              dns,
 		DNSMode:          normDNSMode(l.DNSMode),
+		QueryTimeout:     l.QueryTimeout,
 		ListName:         l.Name,
 		EnableCloudCheck: l.EnableCloudCheck,
 		ECS:              l.ECS,

@@ -183,8 +183,8 @@ func NewRefactoredHandler(cfg *config.Config, logger *utils.EnhancedLogger, qlog
 	// 初始化云服务处理器（统一响应出口回调，保证EDNS/TC处理一致）
 	cloudHandler := NewCloudHandler(cfg, logger, cacheManager, cloudDetector, handler.proxyQuery, handler.writeResponse)
 	// 替换域名回源沿用主查询的解析模式（race/failover/wrandom）
-	cloudHandler.queryWithMode = func(req *dns.Msg, upstreams []string, mode string) (*dns.Msg, error) {
-		resp, _, err := handler.queryWithFallback(req, upstreams, mode)
+	cloudHandler.queryWithMode = func(req *dns.Msg, upstreams []string, mode string, budget time.Duration) (*dns.Msg, error) {
+		resp, _, err := handler.queryWithFallback(req, upstreams, mode, budget)
 		return resp, err
 	}
 	handler.cloudHandler = cloudHandler
@@ -761,7 +761,7 @@ func (h *RefactoredHandler) processNonIPQuery(w dns.ResponseWriter, req *dns.Msg
 	decision, upstreams := h.resolveRoute(domain, clientDecision)
 
 	// 3. 执行查询（不经过云服务检测和替换逻辑）
-	resp, server, err := h.queryWithFallback(req, upstreams, decision.DNSMode)
+	resp, server, err := h.queryWithFallback(req, upstreams, decision.DNSMode, decision.QueryTimeout)
 	if err != nil || resp == nil {
 		h.Logger.Error("❌ [非IP记录查询失败] ", map[string]interface{}{
 			"domain":      domain,
@@ -774,6 +774,7 @@ func (h *RefactoredHandler) processNonIPQuery(w dns.ResponseWriter, req *dns.Msg
 			Domain: domain, QType: dns.TypeToString[qtype],
 			Action: querylog.ActionError, Rcode: "SERVFAIL",
 			Answers: "上游查询失败", ElapsedMS: time.Since(start).Milliseconds(),
+			BudgetMS: decision.QueryTimeout.Milliseconds(),
 		})
 		return
 	}
@@ -791,6 +792,7 @@ func (h *RefactoredHandler) processNonIPQuery(w dns.ResponseWriter, req *dns.Msg
 			Domain: domain, QType: dns.TypeToString[qtype],
 			Action: querylog.ActionError, Rcode: "SERVFAIL",
 			Answers: "上游响应无效: " + dns.RcodeToString[resp.Rcode], ElapsedMS: time.Since(start).Milliseconds(),
+			BudgetMS: decision.QueryTimeout.Milliseconds(),
 		})
 		return
 	}
@@ -814,6 +816,7 @@ func (h *RefactoredHandler) processNonIPQuery(w dns.ResponseWriter, req *dns.Msg
 		Action: action, ListName: listName, DNS: server, DNSMode: mode,
 		Rcode: dns.RcodeToString[resp.Rcode], Answers: answersSummary(resp),
 		ElapsedMS: time.Since(start).Milliseconds(),
+		BudgetMS:  decision.QueryTimeout.Milliseconds(),
 	})
 }
 
@@ -893,12 +896,19 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 	decision, upstreams := h.resolveRoute(domain, clientDecision)
 	ecs := ecsSummary(req, decision)
 
+	// 总超时预算的截止时间：主查询与后续云替换回源共用同一份预算，
+	// 避免「主查询一份 + 替换域名一份」把单次请求耗时翻倍。
+	var budgetDeadline time.Time
+	if decision.QueryTimeout > 0 {
+		budgetDeadline = time.Now().Add(decision.QueryTimeout)
+	}
+
 	// 计时上游查询
 	upstreamTimer := h.Logger.StartTimer("upstream_query")
 
 	// 3. 代理查询上游DNS服务器（按列表解析模式：竞速 / 串行故障转移；全部失败回退 BackupDNS）
 	//    命中分流列表时按列表 ECS 策略处理请求副本（剥离客户端 ECS / 注入本地 ECS）
-	resp, server, err := h.proxyQueryWithCaching(applySplitECS(req, decision), upstreams, domain, qtype, decision.DNSMode, scope)
+	resp, server, err := h.proxyQueryWithCaching(applySplitECS(req, decision), upstreams, domain, qtype, decision.DNSMode, scope, decision.QueryTimeout)
 	upstreamTime := upstreamTimer.End()
 
 	if err != nil || resp == nil {
@@ -916,6 +926,7 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 			Domain: domain, QType: dns.TypeToString[qtype],
 			Action: querylog.ActionError, ListName: decision.ListName, DNSMode: decision.DNSMode,
 			ECS: ecs, Rcode: "SERVFAIL", Answers: "上游查询失败", ElapsedMS: totalTime.Milliseconds(),
+			BudgetMS: decision.QueryTimeout.Milliseconds(),
 		})
 		return
 	}
@@ -972,6 +983,7 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 				Route:     decision,
 				Upstreams: upstreams,
 				DNSMode:   decision.DNSMode,
+				Deadline:  budgetDeadline,
 			})
 		totalTime := totalTimer.End()
 		h.Logger.Debug("✅ [DNS查询完成-云域名替换] ", map[string]interface{}{
@@ -987,6 +999,7 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 			Action: querylog.ActionCloud, ListName: decision.ListName, DNS: server, DNSMode: decision.DNSMode,
 			ECS: ecs, Rcode: rcodeName(finalResp), Answers: answersSummary(finalResp),
 			ElapsedMS: totalTime.Milliseconds(),
+			BudgetMS:  decision.QueryTimeout.Milliseconds(),
 		})
 		return
 	}
@@ -1024,6 +1037,7 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 		Action: action, ListName: listName, DNS: server, DNSMode: mode,
 		ECS: ecs, Rcode: rcodeName(resp), Answers: answersSummary(resp),
 		ElapsedMS: totalTime.Milliseconds(),
+		BudgetMS:  decision.QueryTimeout.Milliseconds(),
 	})
 }
 
@@ -1315,6 +1329,26 @@ func (h *RefactoredHandler) effectiveReplaceConfig(cd ClientDecision) ReplaceCon
 //  2. 客户端命中分组：
 //     a. 先按分组的 SplitRefs 引用顺序匹配域名分流列表（命中哪条复用哪条的策略）
 //     b. 全部未命中 → 用分组 FallbackDNS 兜底（覆盖全局上游）；FallbackDNS 为空则回退全局 upstream
+//
+// firstPositive 返回第一个正数时长（0 表示"未配置/跟随上一层"）
+func firstPositive(vals ...time.Duration) time.Duration {
+	for _, v := range vals {
+		if v > 0 {
+			return v
+		}
+	}
+	return 0
+}
+
+// effectiveQueryTimeout 解析生效的总查询超时：作用域自身配置优先，未配置(0)回退全局 QueryTimeout。
+// 全局也为 0 时返回 0＝不设总量限制，保持旧版逐台累加的行为。
+func (h *RefactoredHandler) effectiveQueryTimeout(scoped time.Duration) time.Duration {
+	if scoped > 0 {
+		return scoped
+	}
+	return h.getConfig().QueryTimeout
+}
+
 func (h *RefactoredHandler) resolveRoute(domain string, cd ClientDecision) (SplitDecision, []string) {
 	if !cd.Matched {
 		d := h.matcherHandler.MatchDomain(domain)
@@ -1323,6 +1357,7 @@ func (h *RefactoredHandler) resolveRoute(domain string, cd ClientDecision) (Spli
 		if d.DNSMode == "" {
 			d.DNSMode = normDNSMode(h.getConfig().DNSMode)
 		}
+		d.QueryTimeout = h.effectiveQueryTimeout(d.QueryTimeout)
 		return d, h.upstreamsFor(domain, d)
 	}
 
@@ -1334,6 +1369,8 @@ func (h *RefactoredHandler) resolveRoute(domain string, cd ClientDecision) (Spli
 			if cd.ECS.Enabled {
 				d.ECS = cd.ECS
 			}
+			// 列表自身没配总超时，则沿用引用它的分组配置，再退到全局
+			d.QueryTimeout = h.effectiveQueryTimeout(firstPositive(d.QueryTimeout, cd.QueryTimeout))
 			h.Logger.Debug("🎯 [客户端分组命中，复用引用分流] ", map[string]interface{}{
 				"rule":   "CLIENT_GROUP_SUBDIVERT",
 				"group":  cd.Label,
@@ -1356,6 +1393,7 @@ func (h *RefactoredHandler) resolveRoute(domain string, cd ClientDecision) (Spli
 		Matched:          true,
 		DNS:              upstreams,
 		DNSMode:          normDNSMode(cd.DNSMode),
+		QueryTimeout:     h.effectiveQueryTimeout(cd.QueryTimeout),
 		ListName:         cd.Label,
 		EnableCloudCheck: true,
 		IPPrefer:         cd.IPPrefer,

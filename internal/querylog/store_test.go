@@ -398,3 +398,45 @@ func TestSummaryNoTimeoutThreshold(t *testing.T) {
 		t.Errorf("阈值 0 时不应判定超时且平均取全量，实际 %+v", sum)
 	}
 }
+
+// 超时判定优先用记录自身生效的总预算（budget_ms）：
+// 配了 5s 预算的 4s 查询不算超时，超预算的才算；未设预算的老记录仍用全局阈值。
+func TestSummaryUsesPerRowBudget(t *testing.T) {
+	s := openTestStore(t, Options{Enabled: true})
+	now := time.Now().Unix()
+	entries := []Entry{
+		// 预算 5s、耗时 4s → 正常（串行模式试过多台上游但未超总预算）
+		{Time: now - 40, Domain: "a.example.com", QType: "A", Action: ActionUpstream,
+			Rcode: "NOERROR", ElapsedMS: 4000, BudgetMS: 5000},
+		// 预算 3s、耗时 4s → 超时
+		{Time: now - 30, Domain: "b.example.com", QType: "A", Action: ActionUpstream,
+			Rcode: "SERVFAIL", ElapsedMS: 4000, BudgetMS: 3000},
+		// 未设预算 → 退回全局阈值 1500，4s 算超时
+		{Time: now - 20, Domain: "c.example.com", QType: "A", Action: ActionError,
+			Rcode: "SERVFAIL", ElapsedMS: 4000},
+	}
+	for _, e := range entries {
+		s.Append(e)
+	}
+	waitWritten(t, s, int64(len(entries)))
+
+	sum, err := s.Summary(Filter{}, 0, 1500)
+	if err != nil {
+		t.Fatalf("统计失败: %v", err)
+	}
+	if sum.Timeouts != 2 {
+		t.Errorf("应按各自预算判定出 2 条超时，实际 %d", sum.Timeouts)
+	}
+	// 平均耗时只统计未超时的那条（4000ms）
+	if sum.AvgElapsedMS != 4000 {
+		t.Errorf("平均耗时应只含未超时的 4000ms，实际 %v", sum.AvgElapsedMS)
+	}
+	if sum.TimeoutAvgElapsedMS != 4000 {
+		t.Errorf("超时平均耗时应为 4000ms，实际 %v", sum.TimeoutAvgElapsedMS)
+	}
+	for _, g := range sum.ByAction {
+		if g.Key == ActionUpstream && (g.Count != 2 || g.AvgElapsedMS != 4000) {
+			t.Errorf("upstream 次数应为 2、平均只含未超时的 4000ms，实际 %+v", g)
+		}
+	}
+}

@@ -4,6 +4,7 @@ import (
 	"net/netip"
 	"sort"
 	"strings"
+	"time"
 
 	"dnsPorxy/internal/config"
 	"dnsPorxy/internal/source"
@@ -42,6 +43,7 @@ type ClientDecision struct {
 	SplitRefs    []string                  // 引用「上游与域名分流」里的列表名，顺序即匹配顺序
 	FallbackDNS  []string                  // 兜底上游：引用分流全部未命中时使用
 	DNSMode      string                    // race / failover，仅作用于兜底查询
+	QueryTimeout time.Duration             // 兜底查询的总超时预算；0=跟随全局 QueryTimeout
 	IPPrefer     string                    // 兜底查询的 A/AAAA 偏好档位（空值=跟随全局默认）
 	ECS          config.ECSPolicy          // 兜底查询的 EDNS Client Subnet 策略
 	CloudReplace config.CloudReplacePolicy // 本线路的云替换目标（可覆写全局）
@@ -106,6 +108,7 @@ func (m *ClientGroupMatcher) Match(clientIP netip.Addr) ClientDecision {
 				SplitRefs:    g.SplitRefs,
 				FallbackDNS:  g.FallbackDNS,
 				DNSMode:      normDNSMode(g.DNSMode),
+				QueryTimeout: g.QueryTimeout,
 				IPPrefer:     g.IPPrefer,
 				ECS:          g.ECS,
 				CloudReplace: g.CloudReplace,
@@ -132,6 +135,7 @@ func (m *ClientGroupMatcher) Match(clientIP netip.Addr) ClientDecision {
 		SplitRefs:    g.SplitRefs,
 		FallbackDNS:  g.FallbackDNS,
 		DNSMode:      normDNSMode(g.DNSMode),
+		QueryTimeout: g.QueryTimeout,
 		IPPrefer:     g.IPPrefer,
 		ECS:          g.ECS,
 		CloudReplace: g.CloudReplace,
@@ -153,6 +157,7 @@ func (m *ClientGroupMatcher) DecisionForScope(scope string) ClientDecision {
 					SplitRefs:    g.SplitRefs,
 					FallbackDNS:  g.FallbackDNS,
 					DNSMode:      normDNSMode(g.DNSMode),
+					QueryTimeout: g.QueryTimeout,
 					IPPrefer:     g.IPPrefer,
 					ECS:          g.ECS,
 					CloudReplace: g.CloudReplace,
@@ -173,6 +178,7 @@ func (m *ClientGroupMatcher) DecisionForScope(scope string) ClientDecision {
 		SplitRefs:    g.SplitRefs,
 		FallbackDNS:  g.FallbackDNS,
 		DNSMode:      normDNSMode(g.DNSMode),
+		QueryTimeout: g.QueryTimeout,
 		IPPrefer:     g.IPPrefer,
 		ECS:          g.ECS,
 		CloudReplace: g.CloudReplace,

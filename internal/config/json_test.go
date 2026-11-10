@@ -308,3 +308,86 @@ func TestConfigJSONGlobalDNSMode(t *testing.T) {
 		t.Error("非法全局 dns_mode 应被拒绝")
 	}
 }
+
+// 总查询超时：全局 / 分流列表 / 客户端分组三处各自独立配置，空值＝跟随上一层
+func TestConfigJSONQueryTimeoutPerScope(t *testing.T) {
+	orig := DefaultConfig()
+	orig.QueryTimeout = 4 * time.Second
+	orig.SplitLists = []SplitList{{
+		Name: "定向", Enabled: true, DNS: []string{"udp://223.5.5.5:53"},
+		DNSMode: DNSModeFailover, QueryTimeout: 2500 * time.Millisecond,
+	}}
+	orig.ISPGroups = []ISPGroup{{
+		ISP: ISPGroupTelecom, Enabled: true, FallbackDNS: []string{"udp://119.29.29.29:53"},
+		DNSMode: DNSModeRace, QueryTimeout: 1500 * time.Millisecond,
+	}}
+	orig.CustomGroups = []CustomGroup{{
+		Name: "机房", Enabled: true, Match: []string{"10.0.0.0/8"},
+		FallbackDNS: []string{"udp://119.29.29.29:53"}, QueryTimeout: 3 * time.Second,
+	}}
+
+	got, err := orig.ToJSON().ToConfig()
+	if err != nil {
+		t.Fatalf("往返转换失败: %v", err)
+	}
+	if got.QueryTimeout != 4*time.Second {
+		t.Errorf("全局总超时往返丢失: %v", got.QueryTimeout)
+	}
+	if len(got.SplitLists) != 1 || got.SplitLists[0].QueryTimeout != 2500*time.Millisecond {
+		t.Errorf("分流列表总超时往返丢失: %+v", got.SplitLists)
+	}
+	if len(got.ISPGroups) != 1 || got.ISPGroups[0].QueryTimeout != 1500*time.Millisecond {
+		t.Errorf("运营商分组总超时往返丢失: %+v", got.ISPGroups)
+	}
+	if len(got.CustomGroups) != 1 || got.CustomGroups[0].QueryTimeout != 3*time.Second {
+		t.Errorf("自定义分组总超时往返丢失: %+v", got.CustomGroups)
+	}
+}
+
+// 未配置总超时应写回空串（而不是 "0s"），并在读回时得到 0
+func TestConfigJSONQueryTimeoutUnsetIsEmpty(t *testing.T) {
+	orig := DefaultConfig()
+	orig.QueryTimeout = 0
+	orig.SplitLists = []SplitList{{Name: "x", Enabled: true, DNS: []string{"udp://223.5.5.5:53"}}}
+
+	j := orig.ToJSON()
+	if j.QueryTimeout != "" {
+		t.Errorf("未配置时应写为空串，实际 %q", j.QueryTimeout)
+	}
+	if j.SplitLists[0].QueryTimeout != "" {
+		t.Errorf("列表未配置时应写为空串，实际 %q", j.SplitLists[0].QueryTimeout)
+	}
+
+	got, err := j.ToConfig()
+	if err != nil {
+		t.Fatalf("往返转换失败: %v", err)
+	}
+	if got.QueryTimeout != 0 || got.SplitLists[0].QueryTimeout != 0 {
+		t.Errorf("空串应解析为 0（不限制/跟随），实际 global=%v list=%v",
+			got.QueryTimeout, got.SplitLists[0].QueryTimeout)
+	}
+}
+
+// 非法总超时：负数与过小值应被 ValidateConfig 拒绝
+func TestValidateQueryTimeoutRejectsInvalid(t *testing.T) {
+	base := *DefaultConfig()
+	base.Timeout = 1500 * time.Millisecond
+
+	for _, d := range []time.Duration{-time.Second, time.Millisecond} {
+		cfg := base
+		cfg.QueryTimeout = d
+		if err := ValidateConfig(&cfg); err == nil {
+			t.Errorf("总超时 %v 应被拒绝", d)
+		}
+	}
+
+	cfg := base
+	cfg.QueryTimeout = 0
+	if err := ValidateConfig(&cfg); err != nil {
+		t.Errorf("0（不限制）应合法: %v", err)
+	}
+	cfg.QueryTimeout = 3 * time.Second
+	if err := ValidateConfig(&cfg); err != nil {
+		t.Errorf("3s 应合法: %v", err)
+	}
+}
