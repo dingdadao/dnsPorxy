@@ -1,77 +1,77 @@
-# 上游 geosite 没有收录、但需要走「🌈 AI」的域名
-# 纯文本清单，一行一个，支持 DOMAIN-SUFFIX 语义（写 xxx.com 即匹配 xxx.com 及其子域）
-# 改完在面板里 reload 配置，或重启内核
+#  geosite  AI
+#  DOMAIN-SUFFIX  xxx.com  xxx.com 
+#  reload 
 
-# —— 用户点名 / 容易漏的 ——
-workbuddy.ai
-civitai.com
-openrouter.ai
-fal.ai
-replicate.com
+#   /  
++.workbuddy.ai
++.civitai.com
++.openrouter.ai
++.fal.ai
++.replicate.com
 
-# —— 推理/模型平台 ——
-together.ai
-groq.com
-fireworks.ai
-deepinfra.com
-mistral.ai
-cohere.com
-anyscale.com
-modal.com
-stability.ai
-ollama.com
-lmstudio.ai
-jan.ai
+#  / 
++.together.ai
++.groq.com
++.fireworks.ai
++.deepinfra.com
++.mistral.ai
++.cohere.com
++.anyscale.com
++.modal.com
++.stability.ai
++.ollama.com
++.lmstudio.ai
++.jan.ai
 
-# —— 生成类（图/视频/音频/3D）——
-ideogram.ai
-leonardo.ai
-playground.com
-krea.ai
-tensor.art
-runwayml.com
-lumalabs.ai
-pika.art
-haiper.ai
-suno.com
-udio.com
-elevenlabs.io
-descript.com
-heygen.com
-synthesia.io
+#  ///3D
++.ideogram.ai
++.leonardo.ai
++.playground.com
++.krea.ai
++.tensor.art
++.runwayml.com
++.lumalabs.ai
++.pika.art
++.haiper.ai
++.suno.com
++.udio.com
++.elevenlabs.io
++.descript.com
++.heygen.com
++.synthesia.io
 
-# —— 对话/角色 ——
-character.ai
-janitorai.com
-venice.ai
-pi.ai
-inflection.ai
-poe.com
-you.com
-phind.com
+#  / 
++.character.ai
++.janitorai.com
++.venice.ai
++.pi.ai
++.inflection.ai
++.poe.com
++.you.com
++.phind.com
 
-# —— 编程助手 ——
-windsurf.com
-codeium.com
-tabnine.com
-supermaven.com
-continue.dev
-v0.dev
-bolt.new
-lovable.dev
+#   
++.windsurf.com
++.codeium.com
++.tabnine.com
++.supermaven.com
++.continue.dev
++.v0.dev
++.bolt.new
++.lovable.dev
 
-# —— 办公/检索 ——
-gamma.app
-tome.app
-jasper.ai
-copy.ai
-writesonic.com
-otter.ai
-fireflies.ai
-exa.ai
-tavily.com
+#  / 
++.gamma.app
++.tome.app
++.jasper.ai
++.copy.ai
++.writesonic.com
++.otter.ai
++.fireflies.ai
++.exa.ai
++.tavily.com
 
-# —— 向量/基础设施 ——
-pinecone.io
-weaviate.io
-qdrant.tech
+#  / 
++.pinecone.io
++.weaviate.io
++.qdrant.tech
