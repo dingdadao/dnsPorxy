@@ -24,6 +24,35 @@ type ReplaceConfig struct {
 	APICount  int    // 接口取前 N 条
 }
 
+// ReplaceContext 云替换回源的线路上下文：决定替换域名这一跳走哪个上游、带什么 ECS、缓存怎么隔离
+//
+// 云替换的核心前提是「进来的线路」：同一个客户端可能从移动或电信进来（CDN 透传了真实客户端 IP），
+// 替换域名必须用该线路自己的上游 + 自己的 ECS 去解析，才能拿到该线路真正就近的替换 IP。
+type ReplaceContext struct {
+	Scope     string        // 客户端线路标识（替换域名缓存按此隔离）
+	Route     SplitDecision // 主查询的分流决策：命中列表按列表 ECS 策略，未命中透传客户端自带 ECS
+	Upstreams []string      // 主查询实际使用的上游（命中列表 DNS / 分组兜底 DNS / 全局），为空时回退全局
+	DNSMode   string        // 主查询的解析模式，替换域名沿用同一模式
+}
+
+// cacheScope 替换域名缓存的隔离标识。
+// 不同线路用的是不同上游与不同 ECS，同一个替换域名可能解析出完全不同的 IP，
+// 因此只要知道线路就必须按线路隔离，否则 A 线路的替换 IP 会被回给 B 线路的客户端。
+func (c ReplaceContext) cacheScope() string {
+	if c.Scope == "" {
+		return "-"
+	}
+	return c.Scope
+}
+
+// upstreams 替换域名回源使用的上游：与主查询完全一致，未指定时回退全局上游
+func (c ReplaceContext) upstreams(fallback []string) []string {
+	if len(c.Upstreams) > 0 {
+		return c.Upstreams
+	}
+	return fallback
+}
+
 // CloudHandler 处理云服务相关功能
 type CloudHandler struct {
 	cfgMu         sync.RWMutex
@@ -31,8 +60,11 @@ type CloudHandler struct {
 	logger        *utils.EnhancedLogger
 	cacheManager  *CacheManager
 	cloudDetector *CloudDetector
-	proxyQuery    func(*dns.Msg, []string) (*dns.Msg, error)   // 代理查询函数
+	proxyQuery    func(*dns.Msg, []string) (*dns.Msg, error)   // 代理查询函数（竞速）
 	respond       func(dns.ResponseWriter, *dns.Msg, *dns.Msg) // 统一响应出口（保证EDNS/TC处理一致）
+	// queryWithMode 按解析模式执行的上游查询（race/failover/wrandom），
+	// 用于让替换域名回源与主查询走同一套模式；未注入时退回 proxyQuery（竞速）
+	queryWithMode func(*dns.Msg, []string, string) (*dns.Msg, error)
 
 	apiMu      sync.RWMutex                 // 保护 apiClients
 	apiClients map[string]*ReplaceAPIClient // 按 (url,count) 索引的 CF 替换接口客户端
@@ -43,6 +75,14 @@ func (ch *CloudHandler) getConfig() *config.Config {
 	ch.cfgMu.RLock()
 	defer ch.cfgMu.RUnlock()
 	return ch.config
+}
+
+// replaceQuery 替换域名回源：按主查询的解析模式执行（未注入模式感知函数时退回竞速）
+func (ch *CloudHandler) replaceQuery(req *dns.Msg, upstreams []string, mode string) (*dns.Msg, error) {
+	if ch.queryWithMode != nil && mode != "" {
+		return ch.queryWithMode(req, upstreams, mode)
+	}
+	return ch.proxyQuery(req, upstreams)
 }
 
 // UpdateConfig 热更新配置引用，并预建/预取所有用到的 CF 替换接口客户端
@@ -138,9 +178,10 @@ func NewCloudHandler(config *config.Config, logger *utils.EnhancedLogger, cacheM
 // 云检测已在processQuery完成，此处不再重复检测；
 // 替换不可用（替换域名解析失败/无可用IP）时降级返回上游原始应答，不整条请求失败
 // ipPrefer 为生效的 A/AAAA 偏好档位：prefer_aaaa 时 AAAA 不再被置空，降级返回上游真实 AAAA
-// scope 为客户端线路的缓存隔离标识；rc 为本次生效的云替换目标（全局或分组覆写）
+// rc 为本次生效的云替换目标（全局或分组覆写）
+// ctx 携带客户端线路标识与本次分流决策：决定替换域名这一跳的 ECS 语义与缓存隔离
 // 返回值是实际写给客户端的响应（供解析日志记录结果），失败时为 nil
-func (ch *CloudHandler) HandleCloudReplacement(w dns.ResponseWriter, req *dns.Msg, domain string, qtype uint16, cloudType int, originalResp *dns.Msg, ipPrefer string, scope string, rc ReplaceConfig) (*dns.Msg, error) {
+func (ch *CloudHandler) HandleCloudReplacement(w dns.ResponseWriter, req *dns.Msg, domain string, qtype uint16, cloudType int, originalResp *dns.Msg, ipPrefer string, rc ReplaceConfig, ctx ReplaceContext) (*dns.Msg, error) {
 	var cloudTypeName string
 	switch CloudType(cloudType) {
 	case CloudTypeCloudflare:
@@ -162,7 +203,7 @@ func (ch *CloudHandler) HandleCloudReplacement(w dns.ResponseWriter, req *dns.Ms
 	})
 
 	// 查询替换域名IP（含缓存与CNAME链解析）
-	v4, v6, err := ch.ResolveReplaceIPs(req.Id, domain, qtype, cloudType, rc)
+	v4, v6, err := ch.ResolveReplaceIPs(req.Id, domain, qtype, cloudType, rc, req, ctx)
 	if err != nil {
 		return ch.respondFallback(w, req, domain, qtype, originalResp, "替换域名查询失败: "+err.Error())
 	}
@@ -204,9 +245,9 @@ func (ch *CloudHandler) HandleCloudReplacement(w dns.ResponseWriter, req *dns.Ms
 
 	// 缓存云替换响应（使用替换缓存时间，按客户端线路 scope 隔离）
 	if ch.getConfig().ReplaceCacheTime > 0 {
-		ch.cacheManager.SetCloudResponseScoped(scope, domain, qtype, finalResp, cloudType, ch.getConfig().ReplaceCacheTime)
+		ch.cacheManager.SetCloudResponseScoped(ctx.Scope, domain, qtype, finalResp, cloudType, ch.getConfig().ReplaceCacheTime)
 	} else {
-		ch.cacheManager.SetCloudResponseScoped(scope, domain, qtype, finalResp, cloudType)
+		ch.cacheManager.SetCloudResponseScoped(ctx.Scope, domain, qtype, finalResp, cloudType)
 	}
 
 	ch.logger.Info("✅ [DNS查询完成-云域名替换] ", map[string]interface{}{
@@ -249,8 +290,15 @@ func (ch *CloudHandler) respondFallback(w dns.ResponseWriter, req *dns.Msg, doma
 
 // ResolveReplaceIPs 获取替换IP：CF 配置了接口时直接从接口取（缓存+预取），否则查询替换域名
 // （先查缓存，未命中回源并缓存），返回去重后的A/AAAA记录；替换目标取自 rc（全局或分组覆写）
-func (ch *CloudHandler) ResolveReplaceIPs(reqID uint16, domain string, qtype uint16, cloudType int, rc ReplaceConfig) ([]*dns.A, []*dns.AAAA, error) {
+//
+// clientReq 为客户端原始请求，ctx 为其线路上下文：替换域名这一跳必须与主查询走同一条线路——
+// 同一个上游集合（命中列表 DNS / 分组兜底 DNS / 全局）与同一套 ECS 语义
+// （分流列表预设线路 / 客户端自带 ECS），否则会按代理出口位置解析，拿到错线路的 IP。
+func (ch *CloudHandler) ResolveReplaceIPs(reqID uint16, domain string, qtype uint16, cloudType int, rc ReplaceConfig, clientReq *dns.Msg, ctx ReplaceContext) ([]*dns.A, []*dns.AAAA, error) {
 	// CF 走接口：跳过替换域名的 DNS 解析（接口只提供 IPv4，AAAA 交由上层按无 v6 替换处理）
+	//
+	// 接口模式不参与 ECS/线路推断：接口本身就按参数（如 ?select=cm / ?select=cu）给出对应线路的优选 IP，
+	// 线路差异由「分组各自的 cf_api URL」承担，这里原样请求即可，注入 ECS 反而会干扰接口语义。
 	if apiClient := ch.apiClientFor(rc.CFAPI, rc.APICount); apiClient != nil && CloudType(cloudType) == CloudTypeCloudflare {
 		if qtype != dns.TypeA {
 			return nil, nil, nil
@@ -266,6 +314,7 @@ func (ch *CloudHandler) ResolveReplaceIPs(reqID uint16, domain string, qtype uin
 			}
 			ch.logger.Debug("🌐 使用替换接口 IP", map[string]interface{}{
 				"url":      apiClient.url,
+				"scope":    ctx.Scope,
 				"ip_count": len(v4),
 			})
 			return v4, nil, nil
@@ -290,16 +339,18 @@ func (ch *CloudHandler) ResolveReplaceIPs(reqID uint16, domain string, qtype uin
 		return nil, nil, fmt.Errorf("replace domain not configured for cloud type %d", cloudType)
 	}
 
-	// 先查缓存（缓存的是原始响应，CNAME链在下方统一解析）
-	replaceResp, hit, _, _ := ch.cacheManager.Get(replaceDomain, qtype)
-	if !hit {
-		replaceReq := &dns.Msg{}
-		replaceReq.SetQuestion(dns.Fqdn(replaceDomain), qtype)
-		// 保持请求ID一致，避免响应匹配问题
-		replaceReq.Id = reqID
+	// 替换域名的回源请求：继承客户端 OPT 与主查询的 ECS 语义（分流列表预设线路 / 客户端自带）
+	replaceReq := buildReplaceQuery(reqID, replaceDomain, qtype, clientReq, ctx.Route)
+	// 走「进来那条线路」自己的上游：移动进来的用移动 DNS、电信进来的用电信 DNS
+	upstreams := ctx.upstreams(ch.getConfig().Upstream)
+	// 不同线路的上游与 ECS 都不同，同一个替换域名可能解析出不同 IP，缓存必须按线路隔离
+	cacheScope := ctx.cacheScope()
 
+	// 先查缓存（缓存的是原始响应，CNAME链在下方统一解析）
+	replaceResp, hit, _, _ := ch.cacheManager.GetScoped(cacheScope, replaceDomain, qtype)
+	if !hit {
 		var err error
-		replaceResp, err = ch.proxyQuery(replaceReq, ch.getConfig().Upstream)
+		replaceResp, err = ch.replaceQuery(replaceReq, upstreams, ctx.DNSMode)
 		// 无应答或上游返回非成功rcode时也要给出可读原因（err为nil时不能直接 %w）
 		if err == nil && (replaceResp == nil || replaceResp.Rcode != dns.RcodeSuccess) {
 			why := "no response"
@@ -314,26 +365,33 @@ func (ch *CloudHandler) ResolveReplaceIPs(reqID uint16, domain string, qtype uin
 		ch.logger.Debug("🔍 替换域名查询成功", map[string]interface{}{
 			"replace_domain": replaceDomain,
 			"qtype":          dns.TypeToString[qtype],
+			"scope":          cacheScope,
+			"ecs":            ecsDesc(replaceReq),
+			"upstreams":      upstreams,
+			"dns_mode":       ctx.DNSMode,
 		})
 	} else {
 		ch.logger.Debug("🎯 使用替换域名缓存", map[string]interface{}{
 			"replace_domain": replaceDomain,
 			"qtype":          dns.TypeToString[qtype],
+			"scope":          cacheScope,
 		})
 	}
 
 	// 对替换域名的响应进行CNAME链解析，获取最终IP（替换域名不再做云检测）
-	processedReplaceResp := ch.processReplaceDomainResponse(replaceResp, replaceDomain, ch.getConfig().Upstream)
+	// CNAME 目标同样是第二跳回源，必须沿用同一个上游、ECS 与缓存 scope
+	processedReplaceResp := ch.processReplaceDomainResponse(replaceResp, replaceDomain, upstreams, replaceReq, ctx, cacheScope)
 	if processedReplaceResp == nil {
 		return nil, nil, fmt.Errorf("replace domain processing failed")
 	}
 
 	// 首次查询且缓存未命中时，缓存处理后的结果（遵循上游TTL，由缓存层递减）
 	if !hit {
-		ch.cacheManager.Set(replaceDomain, qtype, processedReplaceResp, false)
+		ch.cacheManager.SetScoped(cacheScope, replaceDomain, qtype, processedReplaceResp, false)
 		ch.logger.Debug("💾 缓存替换域名查询结果", map[string]interface{}{
 			"replace_domain": replaceDomain,
 			"qtype":          dns.TypeToString[qtype],
+			"scope":          cacheScope,
 			"answer_count":   len(processedReplaceResp.Answer),
 		})
 	}
@@ -1507,7 +1565,8 @@ func (ch *CloudHandler) countType(records []dns.RR, recordType string) int {
 }
 
 // extractFinalIPs 递归提取CNAME链的最终IP记录
-func (ch *CloudHandler) extractFinalIPs(resp *dns.Msg, originalDomain string, upstreams []string, visited map[string]bool, currentDepth, maxDepth int) []dns.RR {
+// template 为已按线路 ECS 处理好的替换域名请求，CNAME 目标沿用同一 ECS 语义与缓存 scope
+func (ch *CloudHandler) extractFinalIPs(resp *dns.Msg, originalDomain string, upstreams []string, visited map[string]bool, currentDepth, maxDepth int, template *dns.Msg, ctx ReplaceContext, cacheScope string) []dns.RR {
 	if resp == nil || currentDepth > maxDepth {
 		return []dns.RR{}
 	}
@@ -1552,11 +1611,10 @@ func (ch *CloudHandler) extractFinalIPs(resp *dns.Msg, originalDomain string, up
 		source := strings.ToLower(strings.TrimSuffix(cnameRecord.Hdr.Name, "."))
 		visited[source] = true
 
-		queryReq := &dns.Msg{}
-		queryReq.SetQuestion(dns.Fqdn(target), resp.Question[0].Qtype)
+		queryReq := buildReplaceQuery(0, target, resp.Question[0].Qtype, template, ctx.Route)
 
 		// 尝试从缓存获取中间域名的响应
-		cachedResp, hit, _, _ := ch.cacheManager.Get(target, resp.Question[0].Qtype)
+		cachedResp, hit, _, _ := ch.cacheManager.GetScoped(cacheScope, target, resp.Question[0].Qtype)
 		var queryResp *dns.Msg
 		var err error
 
@@ -1567,11 +1625,11 @@ func (ch *CloudHandler) extractFinalIPs(resp *dns.Msg, originalDomain string, up
 			})
 			queryResp = cachedResp
 		} else {
-			// 如果缓存中没有，执行查询
-			queryResp, err = ch.proxyQuery(queryReq, upstreams)
+			// 如果缓存中没有，执行查询（沿用主查询的上游与解析模式）
+			queryResp, err = ch.replaceQuery(queryReq, upstreams, ctx.DNSMode)
 			if err == nil && queryResp != nil && queryResp.Rcode == dns.RcodeSuccess {
 				// 将查询结果缓存
-				ch.cacheManager.Set(target, resp.Question[0].Qtype, queryResp, false)
+				ch.cacheManager.SetScoped(cacheScope, target, resp.Question[0].Qtype, queryResp, false)
 				ch.logger.Debug("💾 缓存CNAME目标查询结果", map[string]interface{}{
 					"target":       target,
 					"qtype":        dns.TypeToString[resp.Question[0].Qtype],
@@ -1582,7 +1640,7 @@ func (ch *CloudHandler) extractFinalIPs(resp *dns.Msg, originalDomain string, up
 
 		if err == nil && queryResp != nil && queryResp.Rcode == dns.RcodeSuccess {
 			// 递归处理CNAME目标的响应
-			subIPs := ch.extractFinalIPs(queryResp, originalDomain, upstreams, visited, currentDepth+1, maxDepth)
+			subIPs := ch.extractFinalIPs(queryResp, originalDomain, upstreams, visited, currentDepth+1, maxDepth, template, ctx, cacheScope)
 			finalIPs = append(finalIPs, subIPs...)
 		} else {
 			ch.logger.Debug("❌ CNAME目标查询失败", map[string]interface{}{
@@ -1607,7 +1665,8 @@ func (ch *CloudHandler) extractFinalIPs(resp *dns.Msg, originalDomain string, up
 }
 
 // processReplaceDomainResponse 专门处理替换域名响应，不进行云服务检测
-func (ch *CloudHandler) processReplaceDomainResponse(resp *dns.Msg, domain string, upstreams []string) *dns.Msg {
+// template/ctx/cacheScope 用于让 CNAME 链的每一跳都沿用替换域名的 ECS 语义与缓存隔离
+func (ch *CloudHandler) processReplaceDomainResponse(resp *dns.Msg, domain string, upstreams []string, template *dns.Msg, ctx ReplaceContext, cacheScope string) *dns.Msg {
 	if resp == nil {
 		return resp
 	}
@@ -1638,7 +1697,7 @@ func (ch *CloudHandler) processReplaceDomainResponse(resp *dns.Msg, domain strin
 
 		// 使用辅助函数进行递归解析，获取最终的IP记录
 		visited := make(map[string]bool) // 防止循环引用
-		ipRecords := ch.extractFinalIPs(resp, domain, upstreams, visited, 0, ch.getConfig().CNAMERecursionDepth)
+		ipRecords := ch.extractFinalIPs(resp, domain, upstreams, visited, 0, ch.getConfig().CNAMERecursionDepth, template, ctx, cacheScope)
 
 		// 限制IP记录数量
 		maxIPRecords := ch.getConfig().MaxIPRecords

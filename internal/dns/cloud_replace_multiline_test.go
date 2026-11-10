@@ -99,13 +99,13 @@ func TestResolveReplaceIPsUsesPerGroupAPI(t *testing.T) {
 	ch := NewCloudHandler(cfg, logger, cm, nil, nil, func(dns.ResponseWriter, *dns.Msg, *dns.Msg) {})
 
 	v4, _, err := ch.ResolveReplaceIPs(0, "cloud.example.com", dns.TypeA, int(CloudTypeCloudflare),
-		ReplaceConfig{CFDomain: "cf.example.com", CFAPI: globalURL, APICount: 1})
+		ReplaceConfig{CFDomain: "cf.example.com", CFAPI: globalURL, APICount: 1}, nil, ReplaceContext{})
 	if err != nil || len(v4) != 1 || v4[0].A.String() != "104.16.1.1" {
 		t.Fatalf("全局线路应取全局接口 IP，实际 v4=%v err=%v", v4, err)
 	}
 
 	v4, _, err = ch.ResolveReplaceIPs(0, "cloud.example.com", dns.TypeA, int(CloudTypeCloudflare),
-		ReplaceConfig{CFDomain: "cm.cf.example", CFAPI: cmURL, APICount: 1})
+		ReplaceConfig{CFDomain: "cm.cf.example", CFAPI: cmURL, APICount: 1}, nil, ReplaceContext{})
 	if err != nil || len(v4) != 1 || v4[0].A.String() != "104.24.64.153" {
 		t.Fatalf("覆写线路应取分组接口 IP，实际 v4=%v err=%v", v4, err)
 	}

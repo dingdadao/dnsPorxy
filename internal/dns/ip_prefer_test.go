@@ -189,7 +189,8 @@ func TestCloudReplacementPreferAAAAKeepsUpstreamAAAA(t *testing.T) {
 				func(_ dns.ResponseWriter, _ *dns.Msg, resp *dns.Msg) { written = resp })
 
 			if _, err := ch.HandleCloudReplacement(nopWriter{}, req, "cloud.example.com", dns.TypeAAAA,
-				int(CloudTypeCloudflare), original, c.ipPrefer, "-", ReplaceConfig{CFDomain: cfg.ReplaceCFDomain}); err != nil {
+				int(CloudTypeCloudflare), original, c.ipPrefer,
+				ReplaceConfig{CFDomain: cfg.ReplaceCFDomain}, ReplaceContext{Scope: "-"}); err != nil {
 				t.Fatalf("HandleCloudReplacement 返回错误: %v", err)
 			}
 			if written == nil {

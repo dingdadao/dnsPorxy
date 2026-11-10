@@ -103,6 +103,17 @@
   .card-body.grid .span-2 { grid-column:1/-1; }
   @media (max-width:680px){ .card-body.grid { grid-template-columns:1fr; } }
 
+  /* 提示条（分区内的注意事项） */
+  .note { display:flex; gap:9px; align-items:flex-start; padding:10px 12px;
+    border:1px solid rgba(224,165,60,.35); background:var(--warning-soft); border-radius:8px;
+    color:#ecc87f; font-size:12px; line-height:1.65; }
+  .note svg { flex:none; margin-top:2px; }
+  .note b { display:block; color:#f3d69a; font-weight:620; margin-bottom:2px; }
+  .note code { font-family:var(--mono); font-size:11.5px; color:#f3d69a;
+    background:rgba(0,0,0,.22); padding:1px 5px; border-radius:4px; }
+  .note > div { white-space:pre-line; }
+  .card-body.grid .note { grid-column:1/-1; }
+
   /* 开关卡片 */
   .switch-head { display:flex; align-items:center; gap:14px; justify-content:space-between; padding-bottom:13px; }
   .switch-head .txt h2 { margin:0; font-size:14px; }
@@ -568,10 +579,11 @@ const SECTIONS = [
         help:"用于机房出口、专线等运营商识别覆盖不到的来源。匹配项整体优先于上面的运营商分组，组内按 Priority 从大到小、同值按自上而下顺序匹配；命中即用该组自定义 DNS 解析。" },
     ]},
   ]},
-  { id:"cloud", title:"云 IP 检测与替换", desc:"识别 Cloudflare / AWS 地址并替换为优选 IP。", cards:[
+  { id:"cloud", title:"云 IP 检测与替换", desc:"识别 Cloudflare / AWS 地址并替换为优选 IP。替换域名按客户端所在线路（该线路的上游 + ECS）解析。", cards:[
     { kind:"toggle", key:"enable_cloudflare_check", title:"Cloudflare 检测替换",
       desc:"响应 IP 命中 Cloudflare 网段时，替换为查询替换域名得到的优选 IP。", body:[
-      { id:"replace_cf_domain", label:"CF 替换域名", type:"text", mono:true, span2:true },
+      { id:"replace_cf_domain", label:"CF 替换域名", type:"text", mono:true, span2:true,
+        help:"按命中线路的上游解析；多线路共用同一替换域名时，需该上游支持 ECS 才能按线路返回不同 IP" },
       { id:"replace_cf_api", label:"CF 替换接口", type:"text", mono:true, span2:true,
         help:"留空则按上面的替换域名解析；填了则改从该接口取优选 IP（如 https://cf.niao.fun/api/results?select=cm），结果按「云替换响应缓存时间」缓存，过期后台提前预取" },
       { id:"replace_api_count", label:"接口取前 N 条 IP", type:"number",
@@ -579,7 +591,12 @@ const SECTIONS = [
     ]},
     { kind:"toggle", key:"enable_aws_check", title:"AWS 检测替换",
       desc:"响应 IP 命中 AWS 网段时，替换为查询替换域名得到的优选 IP。", body:[
-      { id:"replace_aws_domain", label:"AWS 替换域名", type:"text", mono:true, span2:true },
+      { id:"replace_aws_domain", label:"AWS 替换域名", type:"text", mono:true, span2:true,
+        help:"按命中线路的上游解析；多线路共用同一替换域名时，需该上游支持 ECS 才能按线路返回不同 IP" },
+    ]},
+    { title:"多线路与 ECS（重要）", body:[
+      { note:true, title:"各线路要拿到自己的替换 IP，必须使用支持 ECS 的 DNS",
+        text:"替换域名的解析与主查询走同一条线路：同一批上游、同一份 ECS。因此「同一个替换域名」在不同线路上能否解析出不同 IP，取决于该线路的上游是否支持 EDNS Client Subnet（ECS）。\n不支持 ECS 的 DNS 只会按它自己的出口位置应答，结果所有线路拿到同一份替换 IP。\n\n三种做法任选其一：\n1）给每个客户端分组 / 分流列表开启 ECS，填入该线路的公网地址段（推荐，替换域名只需一个）；\n2）各线路分别指定线路专属的上游 DNS（如运营商自己的 DNS）；\n3）各分组直接使用不同的替换域名或替换接口（接口可用 `?select=cm` 这类参数区分线路），此时不依赖 ECS。" },
     ]},
     { title:"替换参数", body:[
       { id:"replace_cache_time", label:"云替换响应缓存时间", type:"duration", placeholder:"30m" },
@@ -1018,7 +1035,7 @@ function splitListEditorHTML(items) {
       <div class="sl-opt">
         <div class="txt">
           <span>EDNS 客户端子网（按线路解析）</span>
-          <small>开启后向上游注入下面填的公网 IP，让上游返回对应线路（电信/联通/移动）的结果；关闭时不传 ECS</small>
+          <small>开启后向上游注入下面填的公网 IP，让上游返回对应线路（电信/联通/移动）的结果；云替换的替换域名也按这份 ECS 解析（要求该上游支持 ECS）；关闭时不传 ECS</small>
         </div>
         <button type="button" role="switch" aria-checked="${!!(l.ecs||{}).enabled}" class="switch"
           data-sl-ecs="${i}" aria-label="向上游注入 EDNS 客户端子网"></button>
@@ -1215,7 +1232,7 @@ function groupECSHTML(kind, i, ecs) {
     <div class="sl-opt">
       <div class="txt">
         <span>兜底查询注入 ECS（按线路解析）</span>
-        <small>开启后兜底上游按下面填的公网 IP 返回对应线路；关闭时剥离客户端 ECS</small>
+        <small>开启后兜底上游按下面填的公网 IP 返回对应线路；云替换的替换域名也按这份 ECS 解析（要求该上游支持 ECS）；关闭时剥离客户端 ECS</small>
       </div>
       <button type="button" role="switch" aria-checked="${!!e.enabled}" class="switch"
         data-cg-kind="${kind}" data-cg-idx="${i}" data-cg-field="ecs.enabled" aria-label="ECS 注入开关"></button>
@@ -1242,7 +1259,7 @@ function groupCloudReplaceHTML(kind, i, cr) {
     <div class="sl-opt">
       <div class="txt">
         <span>云 IP 替换（覆写全局，按线路）</span>
-        <small>开启后本线路使用下方替换目标；关闭则跟随全局 CF/AWS 替换配置</small>
+        <small>开启后本线路使用下方替换目标；关闭则跟随全局 CF/AWS 替换配置。若与其它线路共用同一替换域名，需同时开启上面的「兜底查询注入 ECS」且上游支持 ECS，否则各线路会拿到同一份替换 IP</small>
       </div>
       <button type="button" role="switch" aria-checked="${c.override}" class="switch"
         data-cg-kind="${kind}" data-cg-idx="${i}" data-cg-field="cloud_replace.override" aria-label="云替换覆写开关"></button>
@@ -1390,7 +1407,19 @@ function cardHTML(card) {
     ${card.title ? `<div class="card-head"><h2>${esc(card.title)}</h2></div>` : ""}
     <div class="card-body grid">${card.body.map(nodeHTML).join("")}</div></section>`;
 }
+/* 提示条：text 里可用反引号包裹需要高亮的片段（先转义再替换，避免注入） */
+function noteHTML(n) {
+  const text = esc(n.text || "").replace(/`([^`]+)`/g, "<code>$1</code>");
+  return `<div class="note">
+    <svg width="14" height="14" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <path d="M8 1.8 15 14H1L8 1.8Z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round"/>
+      <path d="M8 6.2v3.4M8 11.6v.9" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+    </svg>
+    <div>${n.title ? `<b>${esc(n.title)}</b>` : ""}${text}</div>
+  </div>`;
+}
 function nodeHTML(node) {
+  if (node.note) return noteHTML(node);
   return node.id ? fieldHTML(node) : cardHTML(node);
 }
 
@@ -1756,7 +1785,7 @@ function renderOverrides() {
   $("#view").innerHTML = `<div class="view-inner wide">
     <div class="page-head">
       <h1>域名篡改规则</h1>
-      <p>命中规则后直接返回本地构造的响应，<b>优先级高于缓存与所有上游</b>。域名支持精确（example.com）与后缀（.example.com 或 *.example.com）匹配；A/AAAA 未命中时可回退 CNAME 规则。</p>
+      <p>命中规则后直接返回本地构造的响应，<b>优先级高于缓存与所有上游</b>，<b>仅对内网客户端生效</b>（公网客户端按正常流程解析，避免内网地址外泄）。域名支持精确（example.com）与后缀（.example.com 或 *.example.com）匹配；A/AAAA 未命中时可回退 CNAME 规则。</p>
     </div>
     <div class="rules-toolbar">
       <div class="search">

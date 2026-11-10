@@ -83,7 +83,9 @@ func (cp *CNAMEProcessor) ProcessNonIPResponseWithCNAME(resp *dns.Msg, domain st
 
 // CollectChainIPs 沿CNAME链收集IP记录，仅用于云检测，不改写客户端响应
 // 优先读取缓存中的链上目标响应，未命中则停止（不在查询热路径上产生额外网络IO）
-func (cp *CNAMEProcessor) CollectChainIPs(resp *dns.Msg, domain string, qtype uint16) []dns.RR {
+// scope 为客户端线路标识：链上目标按线路隔离缓存，读错 scope 会漏掉本线路的链上 IP，
+// 导致「上游只回 CNAME 不回 IP」时云检测失效、替换不触发。
+func (cp *CNAMEProcessor) CollectChainIPs(resp *dns.Msg, domain string, qtype uint16, scope string) []dns.RR {
 	if resp == nil || cp.cacheManager == nil {
 		return nil
 	}
@@ -127,7 +129,7 @@ func (cp *CNAMEProcessor) CollectChainIPs(resp *dns.Msg, domain string, qtype ui
 			}
 			visited[target] = true
 
-			cached, hit, _, _ := cp.cacheManager.Get(target, qtype)
+			cached, hit, _, _ := cp.cacheManager.GetScoped(scope, target, qtype)
 			if !hit || cached == nil {
 				continue
 			}

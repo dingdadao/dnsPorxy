@@ -182,6 +182,11 @@ func NewRefactoredHandler(cfg *config.Config, logger *utils.EnhancedLogger, qlog
 
 	// 初始化云服务处理器（统一响应出口回调，保证EDNS/TC处理一致）
 	cloudHandler := NewCloudHandler(cfg, logger, cacheManager, cloudDetector, handler.proxyQuery, handler.writeResponse)
+	// 替换域名回源沿用主查询的解析模式（race/failover/wrandom）
+	cloudHandler.queryWithMode = func(req *dns.Msg, upstreams []string, mode string) (*dns.Msg, error) {
+		resp, _, err := handler.queryWithFallback(req, upstreams, mode)
+		return resp, err
+	}
 	handler.cloudHandler = cloudHandler
 
 	// 初始化文件加载处理器
@@ -195,8 +200,8 @@ func NewRefactoredHandler(cfg *config.Config, logger *utils.EnhancedLogger, qlog
 	// 初始化刷新处理器（云域名刷新时通过该回调重建替换响应，保证与查询路径一致）
 	refreshHandler := NewRefreshHandler(cfg, logger, cacheManager, cloudDetector, queryOptimizer, matcherHandler, handler.proxyQuery,
 		func(originalResp *dns.Msg, domain string, qtype uint16, cloudType int) *dns.Msg {
-			// 异步刷新无法得知客户端线路，统一按全局替换目标重建
-			v4, v6, err := cloudHandler.ResolveReplaceIPs(0, domain, qtype, cloudType, handler.effectiveReplaceConfig(ClientDecision{}))
+			// 异步刷新无法得知客户端线路，统一按全局替换目标重建（不带 ECS、走全局替换缓存）
+			v4, v6, err := cloudHandler.ResolveReplaceIPs(0, domain, qtype, cloudType, handler.effectiveReplaceConfig(ClientDecision{}), nil, ReplaceContext{})
 			if err != nil {
 				return nil
 			}
@@ -613,8 +618,12 @@ func (h *RefactoredHandler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 		return
 	}
 
-	// 本地域名篡改检查（最高优先级）：命中域名一律本地作答，不走缓存与上游
-	if h.overrideMatcher.Match(domain) {
+	// 解析客户端 IP 并确定缓存 scope
+	clientIP, scope := h.resolveClientAndScope(w)
+
+	// 本地域名篡改检查（最高优先级，仅内网客户端）：命中域名本地作答，不走缓存与上游。
+	// 公网客户端按正常流程解析，避免内网地址泄露到公网。
+	if !isPublicIP(clientIP) && h.overrideMatcher.Match(domain) {
 		if records := h.overrideMatcher.Lookup(domain, q.Qtype); len(records) > 0 {
 			overrideResp := buildOverrideResponse(req, q.Qtype, records)
 			if overrideResp == nil {
@@ -661,9 +670,6 @@ func (h *RefactoredHandler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 		})
 		return
 	}
-
-	// 解析客户端 IP 并确定缓存 scope
-	_, scope := h.resolveClientAndScope(w)
 
 	// 协议守卫：RD=0的非递归请求仅用缓存回答，缓存未命中回REFUSED
 	if !req.RecursionDesired {
@@ -924,7 +930,7 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 			"list":   decision.ListName,
 		})
 	} else if !h.cloudDetector.IsReplaceDomain(domain) {
-		chainIPs := h.cnameProcessor.CollectChainIPs(resp, domain, qtype)
+		chainIPs := h.cnameProcessor.CollectChainIPs(resp, domain, qtype, scope)
 		if len(chainIPs) > 0 {
 			probe := &dns.Msg{Answer: chainIPs}
 			if h.getConfig().EnableCloudflareCheck {
@@ -957,8 +963,16 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 		})
 
 		// 云替换内部会自行写响应（与查询路径一致的缓存与出口处理）
+		// 替换域名的回源与主查询走同一条线路：同一上游集合、同一解析模式、同一套 ECS 语义，
+		// 否则会按代理出口位置解析到错线路的替换 IP
 		finalResp, _ := h.cloudHandler.HandleCloudReplacement(w, req, domain, qtype, int(detection.Type), resp,
-			effectiveIPPrefer(h.getConfig().IPPrefer, decision), scope, rc)
+			effectiveIPPrefer(h.getConfig().IPPrefer, decision),
+			rc, ReplaceContext{
+				Scope:     scope,
+				Route:     decision,
+				Upstreams: upstreams,
+				DNSMode:   decision.DNSMode,
+			})
 		totalTime := totalTimer.End()
 		h.Logger.Debug("✅ [DNS查询完成-云域名替换] ", map[string]interface{}{
 			"domain":        domain,
