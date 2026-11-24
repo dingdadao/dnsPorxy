@@ -171,7 +171,7 @@ func TestApplyECSWireFormat(t *testing.T) {
 // 未命中分流列表时不做任何 ECS 干预（原样透传，含客户端自带 ECS）
 func TestApplySplitECSNotMatched(t *testing.T) {
 	req := ecsQuery(1232, false, clientECS("203.0.113.0", 24))
-	got := applySplitECS(req, SplitDecision{})
+	got := applySplitECS(req, SplitDecision{}, netip.Addr{})
 	if got != req {
 		t.Error("未命中分流列表时应原样返回原请求")
 	}
@@ -183,7 +183,7 @@ func TestApplySplitECSNotMatched(t *testing.T) {
 // 命中分流列表且未开启 ECS 时：剥离客户端 ECS，且不污染原请求（req 会被缓存与 single-flight 复用）
 func TestApplySplitECSStripsClientECSOnCopy(t *testing.T) {
 	req := ecsQuery(1232, false, clientECS("203.0.113.0", 24))
-	got := applySplitECS(req, SplitDecision{Matched: true})
+	got := applySplitECS(req, SplitDecision{Matched: true}, netip.Addr{})
 	if got == req {
 		t.Fatal("应返回副本，避免并发污染原请求")
 	}

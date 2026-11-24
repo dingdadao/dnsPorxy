@@ -894,7 +894,10 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 
 	// 2. 分流决策：客户端分组内引用规则优先，未命中走分组默认上游，再回退全局
 	decision, upstreams := h.resolveRoute(domain, clientDecision)
-	ecs := ecsSummary(req, decision)
+
+	// 客户端真实地址：ECS 注入（Auto 模式）与解析日志的 ECS 摘要共用，只解析一次
+	clientIP, _ := h.ResolveClientIP(w)
+	ecs := ecsSummaryFor(req, decision, clientIP)
 
 	// 总超时预算的截止时间：主查询与后续云替换回源共用同一份预算，
 	// 避免「主查询一份 + 替换域名一份」把单次请求耗时翻倍。
@@ -908,7 +911,7 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 
 	// 3. 代理查询上游DNS服务器（按列表解析模式：竞速 / 串行故障转移；全部失败回退 BackupDNS）
 	//    命中分流列表时按列表 ECS 策略处理请求副本（剥离客户端 ECS / 注入本地 ECS）
-	resp, server, err := h.proxyQueryWithCaching(applySplitECS(req, decision), upstreams, domain, qtype, decision.DNSMode, scope, decision.QueryTimeout)
+	resp, server, err := h.proxyQueryWithCaching(applySplitECS(req, decision, clientIP), upstreams, domain, qtype, decision.DNSMode, scope, decision.QueryTimeout)
 	upstreamTime := upstreamTimer.End()
 
 	if err != nil || resp == nil {
@@ -984,6 +987,7 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 				Upstreams: upstreams,
 				DNSMode:   decision.DNSMode,
 				Deadline:  budgetDeadline,
+				ClientIP:  clientIP,
 			})
 		totalTime := totalTimer.End()
 		h.Logger.Debug("✅ [DNS查询完成-云域名替换] ", map[string]interface{}{
@@ -1068,6 +1072,13 @@ func (h *RefactoredHandler) writeResponse(w dns.ResponseWriter, req *dns.Msg, re
 	}
 
 	resp.Compress = true
+
+	// TTL 钳制：缓存命中走 wire 快路径时 TTL 已在写入缓存时钳制，
+	// 但首次未命中的响应直接来自上游对象，必须在这里再施加一次，
+	// 否则同一域名首次查询与后续查询会返回不同 TTL。
+	if h.cacheManager != nil {
+		h.cacheManager.ApplyTTLBounds(resp)
+	}
 
 	// UDP截断：超过客户端通告payload size（无EDNS时为512）时设置TC=1，让客户端转TCP重试
 	if w.RemoteAddr().Network() == "udp" {

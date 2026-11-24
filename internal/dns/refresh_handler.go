@@ -2,6 +2,7 @@ package dns
 
 import (
 	"fmt"
+	"net/netip"
 	"runtime/debug"
 	"sync"
 
@@ -139,8 +140,9 @@ func (rh *RefreshHandler) RefreshDNSRecord(domain string, qtype uint16) error {
 
 	req := &dns.Msg{}
 	req.SetQuestion(dns.Fqdn(domain), qtype)
-	// 命中分流列表时按列表 ECS 策略处理请求副本，避免无 ECS 的结果回写覆盖带 ECS 的缓存
-	reqUpstream := applySplitECS(req, decision)
+	// 命中分流列表时按列表 ECS 策略处理请求副本，避免无 ECS 的结果回写覆盖带 ECS 的缓存。
+	// 异步刷新没有客户端上下文：Auto 模式传无效地址（推导失败→只剥离不注入），手动模式不受影响。
+	reqUpstream := applySplitECS(req, decision, netip.Addr{})
 
 	// 添加请求检查
 	if req == nil {

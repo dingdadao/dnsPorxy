@@ -1,6 +1,7 @@
 package dns
 
 import (
+	"net/netip"
 	"strings"
 	"time"
 
@@ -165,6 +166,41 @@ func ecsSummary(req *dns.Msg, d SplitDecision) string {
 		}
 	}
 	return ""
+}
+
+// ecsSummaryFor 与 ecsSummary 相同，但支持 Auto 模式：
+// Auto 模式下实际注入值来自客户端 IP 推导，必须传入真实客户端地址才能如实记录。
+func ecsSummaryFor(req *dns.Msg, d SplitDecision, clientIP netip.Addr) string {
+	if !d.Matched {
+		return ""
+	}
+	if d.ECS.Auto {
+		if p, ok := d.ECS.ResolveFrom(clientIP); ok {
+			return "注入 " + p.String()
+		}
+		if hasClientECS(req) {
+			return "剥离客户端 ECS"
+		}
+		return ""
+	}
+	return ecsSummary(req, d)
+}
+
+// hasClientECS 判断请求是否自带 ECS
+func hasClientECS(req *dns.Msg) bool {
+	if req == nil {
+		return false
+	}
+	opt := req.IsEdns0()
+	if opt == nil {
+		return false
+	}
+	for _, o := range opt.Option {
+		if _, ok := o.(*dns.EDNS0_SUBNET); ok {
+			return true
+		}
+	}
+	return false
 }
 
 // splitLogFields 分流决策对应的日志字段（命中列表时才有列表名与解析模式）

@@ -219,6 +219,7 @@ type ECSPolicyJSON struct {
 	Enabled bool   `json:"enabled"`
 	ISPType string `json:"isp_type"`
 	Subnet  string `json:"subnet"`
+	Auto    bool   `json:"auto,omitempty"` // 自动模式：按真实客户端 IP 推导，忽略 subnet
 }
 
 // CacheJSON 缓存配置的 JSON 表示
@@ -227,6 +228,9 @@ type CacheJSON struct {
 	TTL             string `json:"ttl"`
 	StaleTTL        string `json:"stale_ttl"`
 	MaxAsyncWorkers int    `json:"max_async_workers"`
+	MinTTL          string `json:"min_ttl,omitempty"`       // TTL 下限，空/0 表示不启用
+	MaxTTL          string `json:"max_ttl,omitempty"`       // TTL 上限，空/0 表示不启用
+	MemoryBudgetMB  int64  `json:"memory_budget_mb,omitempty"` // 缓存内存预算（MB），0 表示不启用自适应
 }
 
 // QueryLogJSON 解析日志配置的 JSON 表示（缺字段时按默认策略启用，老配置不受影响）
@@ -255,6 +259,7 @@ func (c *Config) ToJSON() *ConfigJSON {
 				Enabled: l.ECS.Enabled,
 				ISPType: l.ECS.ISPType,
 				Subnet:  l.ECS.Subnet,
+				Auto:    l.ECS.Auto,
 			},
 			IPPrefer: l.IPPrefer,
 		})
@@ -274,6 +279,7 @@ func (c *Config) ToJSON() *ConfigJSON {
 				Enabled: g.ECS.Enabled,
 				ISPType: g.ECS.ISPType,
 				Subnet:  g.ECS.Subnet,
+				Auto:    g.ECS.Auto,
 			},
 			CloudReplace: cloudReplacePolicyToJSON(g.CloudReplace),
 		})
@@ -295,6 +301,7 @@ func (c *Config) ToJSON() *ConfigJSON {
 				Enabled: g.ECS.Enabled,
 				ISPType: g.ECS.ISPType,
 				Subnet:  g.ECS.Subnet,
+				Auto:    g.ECS.Auto,
 			},
 			CloudReplace: cloudReplacePolicyToJSON(g.CloudReplace),
 		})
@@ -330,6 +337,9 @@ func (c *Config) ToJSON() *ConfigJSON {
 			TTL:             c.Cache.TTL.String(),
 			StaleTTL:        c.Cache.StaleTTL.String(),
 			MaxAsyncWorkers: c.Cache.MaxAsyncWorkers,
+			MinTTL:          durString(c.Cache.MinTTL),
+			MaxTTL:          durString(c.Cache.MaxTTL),
+			MemoryBudgetMB:  c.Cache.MemoryBudget / (1 << 20),
 		},
 		QueryLog: QueryLogJSON{
 			Enabled:   c.QueryLog.Enabled,
@@ -366,6 +376,14 @@ func (c *Config) ToJSON() *ConfigJSON {
 		SourceBaseURL:     c.SourceBaseURL,
 		SourceUpdateHours: c.SourceUpdateHours,
 	}
+}
+
+// durString 时长转字符串：0 输出空串，避免未启用时写出 "0s"
+func durString(d time.Duration) string {
+	if d <= 0 {
+		return ""
+	}
+	return d.String()
 }
 
 // parseDuration 解析时长字符串，空值返回 fallback
@@ -446,6 +464,7 @@ func (j *ConfigJSON) ToConfig() (*Config, error) {
 				Enabled: l.ECS.Enabled,
 				ISPType: l.ECS.ISPType,
 				Subnet:  l.ECS.Subnet,
+				Auto:    l.ECS.Auto,
 			},
 			IPPrefer: l.IPPrefer,
 		})
@@ -529,6 +548,7 @@ func (j *ConfigJSON) ToConfig() (*Config, error) {
 				Enabled: g.ECS.Enabled,
 				ISPType: g.ECS.ISPType,
 				Subnet:  g.ECS.Subnet,
+				Auto:    g.ECS.Auto,
 			},
 			CloudReplace: cloudReplacePolicyFromJSON(g.CloudReplace),
 		})
@@ -558,6 +578,7 @@ func (j *ConfigJSON) ToConfig() (*Config, error) {
 				Enabled: g.ECS.Enabled,
 				ISPType: g.ECS.ISPType,
 				Subnet:  g.ECS.Subnet,
+				Auto:    g.ECS.Auto,
 			},
 			CloudReplace: cloudReplacePolicyFromJSON(g.CloudReplace),
 		})
@@ -632,6 +653,17 @@ func (j *ConfigJSON) ToConfig() (*Config, error) {
 	}
 	if cfg.Cache.StaleTTL, err = parseDuration(j.Cache.StaleTTL, def.Cache.StaleTTL); err != nil {
 		return nil, fmt.Errorf("cache.stale_ttl: %w", err)
+	}
+	if cfg.Cache.MinTTL, err = parseDuration(j.Cache.MinTTL, def.Cache.MinTTL); err != nil {
+		return nil, fmt.Errorf("cache.min_ttl: %w", err)
+	}
+	if cfg.Cache.MaxTTL, err = parseDuration(j.Cache.MaxTTL, def.Cache.MaxTTL); err != nil {
+		return nil, fmt.Errorf("cache.max_ttl: %w", err)
+	}
+	if j.Cache.MemoryBudgetMB > 0 {
+		cfg.Cache.MemoryBudget = j.Cache.MemoryBudgetMB << 20
+	} else {
+		cfg.Cache.MemoryBudget = def.Cache.MemoryBudget
 	}
 	if cfg.QueryLog.Retention, err = parseDuration(j.QueryLog.Retention, queryLog.Retention); err != nil {
 		return nil, fmt.Errorf("query_log.retention: %w", err)

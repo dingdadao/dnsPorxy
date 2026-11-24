@@ -43,6 +43,39 @@ type ECSPolicy struct {
 	Enabled bool   // 是否向上游注入 ECS（关闭时命中该列表仅剥离客户端自带 ECS）
 	ISPType string // 线路类型：telecom/unicom/mobile
 	Subnet  string // 手动指定的公网 IP 或 CIDR（裸 IP 按 /24，IPv6 裸 IP 按 /56）
+	Auto    bool   // 自动模式：忽略 Subnet，按本次查询的真实客户端 IP 推导前缀（内网源不注入）
+}
+
+// ECSPrefixLen 返回按客户端地址推导 ECS 前缀时使用的掩码长度（RFC 7871 建议值）
+func ECSPrefixLen(ip netip.Addr) int {
+	if ip.Is6() {
+		return 56 // IPv6 公开前缀通常 /56
+	}
+	return 24 // IPv4 公开前缀通常 /24
+}
+
+// ResolveFrom 按真实客户端地址推导待注入前缀，供 Auto 模式使用。
+// 客户端地址无效、为内网/回环/链路本地地址时返回 ok=false（不注入），避免把私网段发给上游。
+func (e ECSPolicy) ResolveFrom(clientIP netip.Addr) (netip.Prefix, bool) {
+	if !e.Enabled {
+		return netip.Prefix{}, false
+	}
+	if !clientIP.IsValid() {
+		return netip.Prefix{}, false
+	}
+	ip := clientIP.Unmap() // 去掉 IPv4-mapped IPv6 前缀
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+		return netip.Prefix{}, false
+	}
+	bits := ECSPrefixLen(ip)
+	if bits > ip.BitLen() {
+		return netip.Prefix{}, false
+	}
+	p := netip.PrefixFrom(ip, bits)
+	if !p.IsValid() {
+		return netip.Prefix{}, false
+	}
+	return p.Masked(), true
 }
 
 // Resolve 解析待注入的地址前缀：开关未打开、类型不在白名单、地址不可解析时均返回 ok=false（不注入）
@@ -84,6 +117,9 @@ type CacheConfig struct {
 	TTL             time.Duration // 兜底缓存TTL：上游未提供TTL时使用，不再抬高上游TTL
 	StaleTTL        time.Duration // 过期宽限：条目过期后仍可在该时长内把旧响应返回客户端（0=禁用，过期即未命中）
 	MaxAsyncWorkers int           // 最大异步工作线程数
+	MinTTL          time.Duration // TTL 下限：上游给的有效TTL低于它时，按它缓存（0=不启用钳制）
+	MaxTTL          time.Duration // TTL 上限：上游给的有效TTL高于它时，按它缓存（0=不启用钳制）
+	MemoryBudget    int64         // 缓存内存预算（字节）：0=不启用自适应，只用 MaxItems 硬上限
 }
 
 // 分流列表的 DNS 解析模式
@@ -360,10 +396,13 @@ func DefaultConfig() *Config {
 		LogLevel:               "debug",
 		LogFormat:              "text",
 		Cache: CacheConfig{
-			MaxItems:        5000,
+			MaxItems:        0, // 0 = 不设条数硬上限，容量由 MemoryBudget 自适应决定
 			TTL:             5 * time.Minute,
 			StaleTTL:        5 * time.Minute,
 			MaxAsyncWorkers: 2,
+			MinTTL:          10 * time.Second,
+			MaxTTL:          24 * time.Hour,
+			MemoryBudget:    64 << 20, // 64MB
 		},
 		QueryLog: QueryLogConfig{
 			Enabled:   true,
@@ -481,8 +520,10 @@ func ValidateConfig(cfg *Config) error {
 	if cfg.WebTLSAddr == "" {
 		cfg.WebTLSAddr = DefaultWebTLSAddr
 	}
-	if cfg.Cache.MaxItems <= 0 {
-		cfg.Cache.MaxItems = 5000
+	// MaxItems 0 表示不设条数硬上限（容量交给 MemoryBudget 自适应）；
+	// 负数视为配置错误归零，不再强塞 5000 的旧默认。
+	if cfg.Cache.MaxItems < 0 {
+		cfg.Cache.MaxItems = 0
 	}
 	if cfg.Cache.TTL <= 0 {
 		cfg.Cache.TTL = 5 * time.Minute
@@ -493,6 +534,27 @@ func ValidateConfig(cfg *Config) error {
 	// 过期宽限允许为 0（禁用 serve-stale），仅把负值归零避免出现"负宽限"
 	if cfg.Cache.StaleTTL < 0 {
 		cfg.Cache.StaleTTL = 0
+	}
+	// TTL 钳制：0 表示不启用；负值归零；两者都启用时必须 min <= max
+	if cfg.Cache.MinTTL < 0 {
+		cfg.Cache.MinTTL = 0
+	}
+	if cfg.Cache.MaxTTL < 0 {
+		cfg.Cache.MaxTTL = 0
+	}
+	if cfg.Cache.MinTTL > 0 && cfg.Cache.MaxTTL > 0 && cfg.Cache.MinTTL > cfg.Cache.MaxTTL {
+		return fmt.Errorf("cache.min_ttl (%s) 不能大于 cache.max_ttl (%s)",
+			cfg.Cache.MinTTL, cfg.Cache.MaxTTL)
+	}
+	// 内存预算：负值归零；0 表示未配置，补上默认预算（64MB）让自适应容量生效。
+	// 想彻底关掉自适应、只按 MaxItems 控制时，把 max_items 设成正数即可
+	// （此时容量取 min(max_items, 预算反推值)）。
+	if cfg.Cache.MemoryBudget < 0 {
+		cfg.Cache.MemoryBudget = 0
+	}
+	if cfg.Cache.MemoryBudget == 0 && cfg.Cache.MaxItems <= 0 {
+		// 两者都没配 → 至少给个安全默认，避免容量无限增长
+		cfg.Cache.MemoryBudget = 64 << 20
 	}
 	if cfg.QueryLog.Retention <= 0 {
 		cfg.QueryLog.Retention = DefaultQueryLogRetention

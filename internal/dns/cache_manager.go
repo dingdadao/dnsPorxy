@@ -78,6 +78,12 @@ func NewCacheManager(cfg *config.Config, logger *utils.EnhancedLogger) *CacheMan
 	// 过期宽限（serve-stale 窗口）从配置传导到缓存层
 	cm.cache.SetStaleTTL(cfg.Cache.StaleTTL)
 
+	// TTL 钳制上下限从配置传导到缓存层
+	cm.cache.SetTTLBounds(cfg.Cache.MinTTL, cfg.Cache.MaxTTL)
+
+	// 内存预算传导（启用后容量由预算自适应）
+	cm.cache.SetMemoryBudget(cfg.Cache.MemoryBudget)
+
 	// 按需刷新模式下不启动定期扫描任务
 	// if cfg.Cache.EnableAsyncRefresh {
 	// 	go cm.startCacheScanTask()
@@ -86,6 +92,10 @@ func NewCacheManager(cfg *config.Config, logger *utils.EnhancedLogger) *CacheMan
 	logger.Info("🗄️ 缓存管理器初始化完成", map[string]interface{}{
 		"max_items":     cfg.Cache.MaxItems,
 		"ttl":           cfg.Cache.TTL.String(),
+		"min_ttl":       cfg.Cache.MinTTL.String(),
+		"max_ttl":       cfg.Cache.MaxTTL.String(),
+		"stale_ttl":     cfg.Cache.StaleTTL.String(),
+		"memory_budget": fmt.Sprintf("%dMB", cfg.Cache.MemoryBudget/(1<<20)),
 		"async_workers": cfg.Cache.MaxAsyncWorkers,
 		"async_refresh": true, // 异步刷新默认启用
 	})
@@ -109,6 +119,15 @@ func (cm *CacheManager) UpdateConfig(cfg *config.Config) {
 	cm.cache.SetDefaultTTL(cfg.Cache.TTL)
 	// 过期宽限热更新传导到缓存层
 	cm.cache.SetStaleTTL(cfg.Cache.StaleTTL)
+	// TTL 钳制上下限热更新传导到缓存层
+	cm.cache.SetTTLBounds(cfg.Cache.MinTTL, cfg.Cache.MaxTTL)
+	// 内存预算热更新传导（容量随之重算）
+	cm.cache.SetMemoryBudget(cfg.Cache.MemoryBudget)
+}
+
+// ApplyTTLBounds 对外暴露 TTL 钳制，供响应出口在直出上游响应时复用同一套规则
+func (cm *CacheManager) ApplyTTLBounds(msg *dns.Msg) bool {
+	return cm.cache.applyTTLBounds(msg)
 }
 
 // Get 获取缓存（默认 scope "-"）

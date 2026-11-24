@@ -1,6 +1,7 @@
 package dns
 
 import (
+	"net/netip"
 	"time"
 
 	"dnsPorxy/internal/config"
@@ -38,7 +39,8 @@ func (h *RefactoredHandler) filterAAAA(w dns.ResponseWriter, req *dns.Msg, domai
 	lookupDNS := ""
 	reason := "只能A：AAAA 一律置空"
 	if prefer == config.IPPreferA {
-		hasA, server := h.hasARecord(domain, d, scope)
+		filterClientIP, _ := h.ResolveClientIP(w)
+		hasA, server := h.hasARecord(domain, d, scope, filterClientIP)
 		if !hasA {
 			return false // 无 A 记录（纯 v6 域名）：放行，照常返回上游 AAAA
 		}
@@ -53,7 +55,8 @@ func (h *RefactoredHandler) filterAAAA(w dns.ResponseWriter, req *dns.Msg, domai
 	resp.Authoritative = false
 	h.writeResponse(w, req, resp)
 
-	h.Logger.Info("🚫 [A/AAAA 偏好策略置空] ", map[string]interface{}{
+	// 这是每次 AAAA 查询都会走的正常分支，按 Info 记录会占到日志总量的 90%+，降为 Debug
+	h.Logger.Debug("🚫 [A/AAAA 偏好策略置空] ", map[string]interface{}{
 		"rule":        "IP_PREFER_FILTERED",
 		"domain":      domain,
 		"qtype":       dns.TypeToString[dns.TypeAAAA],
@@ -79,14 +82,14 @@ func (h *RefactoredHandler) filterAAAA(w dns.ResponseWriter, req *dns.Msg, domai
 
 // hasARecord 判断域名是否存在 A 记录：先读缓存，未命中才补查一次 A
 // 补查复用分流路由（上游、解析模式、ECS），结果由缓存层缓存，后续 AAAA 查询不再重复回源
-func (h *RefactoredHandler) hasARecord(domain string, d SplitDecision, scope string) (bool, string) {
+func (h *RefactoredHandler) hasARecord(domain string, d SplitDecision, scope string, clientIP netip.Addr) (bool, string) {
 	if resp, hit, _, _ := h.cacheManager.GetScoped(scope, domain, dns.TypeA); hit {
 		return hasIPv4Answer(resp), ""
 	}
 
 	req := &dns.Msg{}
 	req.SetQuestion(dns.Fqdn(domain), dns.TypeA)
-	resp, server, err := h.proxyQueryWithCaching(applySplitECS(req, d), h.upstreamsFor(domain, d), domain, dns.TypeA, d.DNSMode, scope, d.QueryTimeout)
+	resp, server, err := h.proxyQueryWithCaching(applySplitECS(req, d, clientIP), h.upstreamsFor(domain, d), domain, dns.TypeA, d.DNSMode, scope, d.QueryTimeout)
 	if err != nil {
 		h.Logger.Debug("⚠️ [A/AAAA 偏好判定补查 A 失败，放行 AAAA] ", map[string]interface{}{
 			"rule":   "IP_PREFER_LOOKUP_A_FAILED",

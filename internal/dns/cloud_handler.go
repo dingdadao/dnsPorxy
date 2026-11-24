@@ -37,6 +37,9 @@ type ReplaceContext struct {
 	// 否则「主查询一份预算 + 替换域名一份预算」会让单次请求最坏耗时翻倍。
 	// 零值表示主查询未配置总超时预算，替换回源同样不限制。
 	Deadline time.Time
+	// ClientIP 本次查询还原出的真实客户端地址：ECS Auto 模式下替换域名
+	// 必须按同一客户端推导前缀，否则会按代理出口位置解析到错线路。
+	ClientIP netip.Addr
 }
 
 // remainingBudget 主查询总预算的剩余部分；Deadline 为零（未配置总预算）时返回 0＝不限制。
@@ -357,7 +360,7 @@ func (ch *CloudHandler) ResolveReplaceIPs(reqID uint16, domain string, qtype uin
 	}
 
 	// 替换域名的回源请求：继承客户端 OPT 与主查询的 ECS 语义（分流列表预设线路 / 客户端自带）
-	replaceReq := buildReplaceQuery(reqID, replaceDomain, qtype, clientReq, ctx.Route)
+	replaceReq := buildReplaceQuery(reqID, replaceDomain, qtype, clientReq, ctx.Route, ctx.ClientIP)
 	// 走「进来那条线路」自己的上游：移动进来的用移动 DNS、电信进来的用电信 DNS
 	upstreams := ctx.upstreams(ch.getConfig().Upstream)
 	// 不同线路的上游与 ECS 都不同，同一个替换域名可能解析出不同 IP，缓存必须按线路隔离
@@ -1628,7 +1631,7 @@ func (ch *CloudHandler) extractFinalIPs(resp *dns.Msg, originalDomain string, up
 		source := strings.ToLower(strings.TrimSuffix(cnameRecord.Hdr.Name, "."))
 		visited[source] = true
 
-		queryReq := buildReplaceQuery(0, target, resp.Question[0].Qtype, template, ctx.Route)
+		queryReq := buildReplaceQuery(0, target, resp.Question[0].Qtype, template, ctx.Route, ctx.ClientIP)
 
 		// 尝试从缓存获取中间域名的响应
 		cachedResp, hit, _, _ := ch.cacheManager.GetScoped(cacheScope, target, resp.Question[0].Qtype)

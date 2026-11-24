@@ -15,12 +15,22 @@ const ecsDefaultUDPSize = 1232
 // applySplitECS 准备发往上游的请求：命中分流列表时按该列表的 ECS 策略处理，
 // 未命中列表时不干预（沿用既有转发行为）。
 // 需要改动时在 req 的副本上操作——req 会被 single-flight 与缓存复用，原地修改会并发污染。
-func applySplitECS(req *dns.Msg, d SplitDecision) *dns.Msg {
+// clientIP 为本次查询还原出的真实客户端地址：Auto 模式下用它推导 ECS 前缀，
+// 手动模式下被忽略（保持原有行为）。
+func applySplitECS(req *dns.Msg, d SplitDecision, clientIP netip.Addr) *dns.Msg {
 	if !d.Matched {
 		return req
 	}
 	var inject *netip.Prefix
-	if p, ok := d.ECS.Resolve(); ok {
+	var p netip.Prefix
+	var ok bool
+	if d.ECS.Auto {
+		// 自动模式：按真实客户端 IP 推导（内网/无效地址会返回 ok=false，此时只剥离不注入）
+		p, ok = d.ECS.ResolveFrom(clientIP)
+	} else {
+		p, ok = d.ECS.Resolve()
+	}
+	if ok {
 		inject = &p
 	}
 	out := req.Copy()
@@ -118,7 +128,7 @@ func ecsDesc(msg *dns.Msg) string {
 //   - 命中分流列表且开启 ECS → 剥离客户端 ECS，注入列表预设线路
 //   - 命中分流列表但未开 ECS → 剥离客户端 ECS（不打开不传）
 //   - 未命中分流列表 → 原样透传客户端自带 ECS
-func buildReplaceQuery(reqID uint16, name string, qtype uint16, clientReq *dns.Msg, d SplitDecision) *dns.Msg {
+func buildReplaceQuery(reqID uint16, name string, qtype uint16, clientReq *dns.Msg, d SplitDecision, clientIP netip.Addr) *dns.Msg {
 	out := new(dns.Msg)
 	out.SetQuestion(dns.Fqdn(name), qtype)
 	out.Id = reqID
@@ -134,5 +144,5 @@ func buildReplaceQuery(reqID uint16, name string, qtype uint16, clientReq *dns.M
 		}
 	}
 
-	return applySplitECS(out, d)
+	return applySplitECS(out, d, clientIP)
 }

@@ -111,11 +111,21 @@ func (p *CacheEntryPool) Put(entry *CacheEntry) {
 type OptimizedDNSCache struct {
 	shards     []*CacheShard
 	shardCount int
-	maxSize    int
+	maxSize    atomic.Int64 // 当前生效容量（可被自适应算法调整）
+	hardMax    int          // 配置里的显式上限（max_items）；0 表示不设硬上限
+	budget     atomic.Int64 // 内存预算（字节）；0 表示不启用自适应
 	defaultTTL atomic.Int64 // 兜底TTL（纳秒），支持热更新
 	staleTTL   atomic.Int64 // 过期宽限（纳秒），0=禁用 serve-stale；支持热更新
+	minTTL     atomic.Int64 // TTL 下限（纳秒），0=不钳制；支持热更新
+	maxTTL     atomic.Int64 // TTL 上限（纳秒），0=不钳制；支持热更新
 	entryPool  *CacheEntryPool
 }
+
+// approxEntryOverhead 单个条目的结构体/字符串/指针开销估算（不含 wire 字节）
+const approxEntryOverhead = 320
+
+// minDynamicCapacity 自适应容量下限，避免平均条目偏大时把容量压到个位数
+const minDynamicCapacity = 1000
 
 // NewOptimizedDNSCache 创建一个新的优化DNS缓存系统
 func NewOptimizedDNSCache(maxSize int, defaultTTL time.Duration) *OptimizedDNSCache {
@@ -136,9 +146,10 @@ func NewOptimizedDNSCache(maxSize int, defaultTTL time.Duration) *OptimizedDNSCa
 	cache := &OptimizedDNSCache{
 		shards:     shards,
 		shardCount: shardCount,
-		maxSize:    maxSize,
+		hardMax:    maxSize,
 		entryPool:  NewCacheEntryPool(),
 	}
+	cache.maxSize.Store(int64(maxSize))
 	cache.defaultTTL.Store(int64(defaultTTL))
 
 	// 启动后台清理协程
@@ -165,6 +176,133 @@ func (c *OptimizedDNSCache) SetStaleTTL(ttl time.Duration) {
 // staleGrace 返回当前过期宽限
 func (c *OptimizedDNSCache) staleGrace() time.Duration {
 	return time.Duration(c.staleTTL.Load())
+}
+
+// SetMemoryBudget 热更新缓存内存预算（0 表示不启用自适应，只用 hardMax）
+func (c *OptimizedDNSCache) SetMemoryBudget(budget int64) {
+	c.budget.Store(budget)
+	c.recalcCapacity()
+}
+
+// capacity 返回当前生效容量
+func (c *OptimizedDNSCache) capacity() int {
+	return int(c.maxSize.Load())
+}
+
+// recalcCapacity 按内存预算与实测平均条目大小重算容量。
+// 未启用预算时直接回落到 hardMax；启用时取 min(hardMax, 预算/平均字节)，
+// 且不低于 minDynamicCapacity，避免抖动。
+func (c *OptimizedDNSCache) recalcCapacity() {
+	hard := c.hardMax
+	budget := c.budget.Load()
+	if budget <= 0 {
+		if hard > 0 {
+			c.maxSize.Store(int64(hard))
+		}
+		return
+	}
+
+	total, count := c.usage()
+	avg := int64(approxEntryOverhead)
+	if count > 0 && total > 0 {
+		avg = total / int64(count)
+		if avg < 64 {
+			avg = 64
+		}
+	}
+
+	dynamic := budget / avg
+	if dynamic < minDynamicCapacity {
+		dynamic = minDynamicCapacity
+	}
+	final := dynamic
+	if hard > 0 && int64(hard) < dynamic {
+		final = int64(hard)
+	}
+	c.maxSize.Store(final)
+}
+
+// usage 汇总当前条目数与估算占用字节
+func (c *OptimizedDNSCache) usage() (totalBytes int64, count int) {
+	for _, shard := range c.shards {
+		shard.mu.RLock()
+		for _, e := range shard.store {
+			count++
+			totalBytes += int64(approxEntryOverhead + len(e.wire))
+		}
+		shard.mu.RUnlock()
+	}
+	return totalBytes, count
+}
+
+// SetTTLBounds 热更新 TTL 钳制上下限（0 表示该方向不钳制）
+func (c *OptimizedDNSCache) SetTTLBounds(minTTL, maxTTL time.Duration) {
+	c.minTTL.Store(int64(minTTL))
+	c.maxTTL.Store(int64(maxTTL))
+}
+
+// clampTTL 把上游给出的有效 TTL 钳制到 [minTTL, maxTTL] 区间。
+// 只钳制"从上游响应里取到的真实 TTL"，兜底 TTL 不参与（那是我们自己的默认值）。
+// 配置为 0 表示该方向不生效；min 大于 max 时以 normalize 阶段的校验拦截，此处兜底按 min 优先。
+func (c *OptimizedDNSCache) clampTTL(ttl time.Duration) time.Duration {
+	if minTTL := time.Duration(c.minTTL.Load()); minTTL > 0 && ttl < minTTL {
+		ttl = minTTL
+	}
+	if maxTTL := time.Duration(c.maxTTL.Load()); maxTTL > 0 && ttl > maxTTL {
+		ttl = maxTTL
+	}
+	return ttl
+}
+
+// applyTTLBounds 就地把响应中所有 RR（OPT 除外）的 TTL 改写进钳制区间。
+// 这是 TTL 钳制真正对客户端生效的地方：缓存的 wire 快路径会把 RR TTL 固定进 wireMeta，
+// 只在 Set 里改过期时间是不够的。
+// 返回是否发生了改写。
+func (c *OptimizedDNSCache) applyTTLBounds(msg *dns.Msg) bool {
+	if msg == nil {
+		return false
+	}
+	minTTL := time.Duration(c.minTTL.Load())
+	maxTTL := time.Duration(c.maxTTL.Load())
+	if minTTL <= 0 && maxTTL <= 0 {
+		return false
+	}
+
+	minSec := uint32(0)
+	if minTTL > 0 {
+		minSec = uint32(minTTL / time.Second)
+	}
+	maxSec := uint32(0)
+	if maxTTL > 0 {
+		maxSec = uint32(maxTTL / time.Second)
+	}
+
+	// 负缓存（NXDOMAIN / 无答案）不施加下限，否则错误结果会粘住很久（RFC 2308）
+	applyMin := msg.Rcode == dns.RcodeSuccess && len(msg.Answer) > 0
+
+	changed := false
+	rewrite := func(rrs []dns.RR) {
+		for _, rr := range rrs {
+			h := rr.Header()
+			if h.Rrtype == dns.TypeOPT {
+				continue // OPT 的 TTL 字段承载 EDNS 标志位，绝不能改
+			}
+			orig := h.Ttl
+			if applyMin && minSec > 0 && h.Ttl < minSec {
+				h.Ttl = minSec
+			}
+			if maxSec > 0 && h.Ttl > maxSec {
+				h.Ttl = maxSec
+			}
+			if h.Ttl != orig {
+				changed = true
+			}
+		}
+	}
+	rewrite(msg.Answer)
+	rewrite(msg.Ns)
+	rewrite(msg.Extra)
+	return changed
 }
 
 // key 生成缓存键，scope 用于客户端分组隔离（未命中分组为 "-"）
@@ -489,7 +627,7 @@ func (c *OptimizedDNSCache) SetCloudResponse(scope, domain string, qType uint16,
 	defer shard.mu.Unlock()
 
 	// 检查是否需要清理缓存
-	if len(shard.store) >= c.maxSize/c.shardCount {
+	if cap := c.capacity(); cap > 0 && len(shard.store) >= cap/c.shardCount {
 		c.evictLeastRecentlyUsed(shard)
 	}
 
@@ -737,7 +875,7 @@ func (c *OptimizedDNSCache) Set(scope, domain string, qType uint16, response *dn
 		defer shard.mu.Unlock()
 
 		// 检查是否需要清理缓存
-		if len(shard.store) >= c.maxSize/c.shardCount {
+		if cap := c.capacity(); cap > 0 && len(shard.store) >= cap/c.shardCount {
 			c.evictLeastRecentlyUsed(shard)
 		}
 
@@ -778,6 +916,10 @@ func (c *OptimizedDNSCache) Set(scope, domain string, qType uint16, response *dn
 	// 深拷贝响应对象
 	responseCopy := response.Copy()
 
+	// 先对副本施加 TTL 钳制（改写每个 RR 的 TTL）。
+	// 必须在计算 actualTTL 之前做：这样缓存过期时间与返回给客户端的 TTL 同源一致。
+	c.applyTTLBounds(responseCopy)
+
 	// 计算实际TTL：遵循上游响应中的最小TTL，绝不抬高；无有效TTL时用默认TTL兜底
 	actualTTL := c.defTTL()
 	if responseCopy != nil && len(responseCopy.Answer) > 0 {
@@ -791,9 +933,9 @@ func (c *OptimizedDNSCache) Set(scope, domain string, qType uint16, response *dn
 			}
 		}
 
-		// 如果有有效的TTL，直接使用上游TTL
+		// 如果有有效的TTL，按上游TTL并施加钳制（min_ttl/max_ttl）
 		if minTTL > 0 {
-			actualTTL = time.Duration(minTTL) * time.Second
+			actualTTL = c.clampTTL(time.Duration(minTTL) * time.Second)
 		}
 	}
 
@@ -817,7 +959,7 @@ func (c *OptimizedDNSCache) Set(scope, domain string, qType uint16, response *dn
 	defer shard.mu.Unlock()
 
 	// 检查容量，如果达到上限，删除最少访问的条目
-	if len(shard.store) >= c.maxSize/c.shardCount && c.maxSize > 0 {
+	if cap := c.capacity(); cap > 0 && len(shard.store) >= cap/c.shardCount {
 		c.evictLeastRecentlyUsed(shard)
 	}
 
@@ -836,7 +978,7 @@ func (c *OptimizedDNSCache) SetWithTTL(scope, domain string, qType uint16, respo
 		defer shard.mu.Unlock()
 
 		// 检查是否需要清理缓存
-		if len(shard.store) >= c.maxSize/c.shardCount {
+		if cap := c.capacity(); cap > 0 && len(shard.store) >= cap/c.shardCount {
 			c.evictLeastRecentlyUsed(shard)
 		}
 
@@ -877,8 +1019,19 @@ func (c *OptimizedDNSCache) SetWithTTL(scope, domain string, qType uint16, respo
 	// 深拷贝响应对象
 	responseCopy := response.Copy()
 
-	// 使用调用方给定的TTL（如负缓存TTL），绝不抬高
+	// 先对副本施加 TTL 钳制（负缓存不受下限影响，见 applyTTLBounds 内部判断）
+	c.applyTTLBounds(responseCopy)
+
+	// 使用调用方给定的TTL（如负缓存TTL）。
+	// 只有正向成功响应才施加 min_ttl 下限；负缓存/云替换等短TTL场景不得被抬高，
+	// 否则 NXDOMAIN 与失败结果会粘住很久（RFC 2308 要求负缓存保持短生命周期）。
 	actualTTL := customTTL
+	if response != nil && response.Rcode == dns.RcodeSuccess && len(response.Answer) > 0 {
+		actualTTL = c.clampTTL(actualTTL)
+	} else if maxTTL := time.Duration(c.maxTTL.Load()); maxTTL > 0 && actualTTL > maxTTL {
+		// 非正向响应也受上限约束，避免异常长 TTL 驻留
+		actualTTL = maxTTL
+	}
 
 	// 计算过期时间和刷新阈值
 	expireAt := time.Now().Add(actualTTL)
@@ -900,7 +1053,7 @@ func (c *OptimizedDNSCache) SetWithTTL(scope, domain string, qType uint16, respo
 	defer shard.mu.Unlock()
 
 	// 检查容量，如果达到上限，删除最少访问的条目
-	if len(shard.store) >= c.maxSize/c.shardCount && c.maxSize > 0 {
+	if cap := c.capacity(); cap > 0 && len(shard.store) >= cap/c.shardCount {
 		c.evictLeastRecentlyUsed(shard)
 	}
 
@@ -1045,6 +1198,8 @@ func (c *OptimizedDNSCache) cleanupRoutine() {
 			}
 			shard.mu.Unlock()
 		}
+		// 清理后重新评估容量（平均条目大小会随实际数据变化）
+		c.recalcCapacity()
 	}
 }
 
@@ -1167,7 +1322,7 @@ func (c *OptimizedDNSCache) DebugCache() {
 func (c *OptimizedDNSCache) GetStats(includeEntries bool) *CacheStats {
 	stats := &CacheStats{
 		Size:    0,
-		MaxSize: c.maxSize,
+		MaxSize: c.capacity(),
 		Entries: make(map[string]EntryInfo),
 	}
 
@@ -1235,7 +1390,7 @@ func (c *OptimizedDNSCache) GetHotEntries(limit int) []HotEntry {
 		Key        string
 		Entry      *CacheEntry
 		LastAccess time.Time
-	}, 0, c.maxSize)
+	}, 0, c.capacity())
 
 	// 遍历所有分片
 	for _, shard := range c.shards {

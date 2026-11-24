@@ -135,7 +135,12 @@ func TestValidateConfig(t *testing.T) {
 	if err := ValidateConfig(cfg); err != nil {
 		t.Errorf("校验失败: %v", err)
 	}
-	if cfg.Cache.MaxItems != 5000 || cfg.WebAddr != DefaultWebAddr {
+	// MaxItems 0 表示不设条数硬上限（容量交给 MemoryBudget 自适应），属合法值；
+	// 需要校验的是 WebAddr 与内存预算这类真正有默认值的字段。
+	if cfg.Cache.MaxItems != 0 || cfg.WebAddr != DefaultWebAddr {
 		t.Errorf("缺省值未补齐: %+v", cfg.Cache)
+	}
+	if cfg.Cache.MemoryBudget != DefaultConfig().Cache.MemoryBudget {
+		t.Errorf("内存预算未补默认值: %d", cfg.Cache.MemoryBudget)
 	}
 }
