@@ -136,7 +136,22 @@ func (d *dohResponseWriter) WriteMsg(m *dns.Msg) error {
 	return err
 }
 
+// Write 处理「缓存命中走 wire 快路径」的直接字节写出。
+// 这条路径不经过 WriteMsg，必须在这里补上 RFC 8484 §4.2.1 要求的响应头，
+// 否则严格的 DoH 客户端会因缺少 Content-Type（Go 会嗅探成 application/octet-stream）而拒绝响应。
 func (d *dohResponseWriter) Write(p []byte) (int, error) {
+	if !d.written {
+		if d.w.Header().Get("Content-Type") == "" {
+			d.w.Header().Set("Content-Type", dohMediaType)
+		}
+		if d.w.Header().Get("Cache-Control") == "" {
+			if m := new(dns.Msg); m.Unpack(p) == nil {
+				d.w.Header().Set("Cache-Control", fmt.Sprintf("max-age=%d", minTTL(m)))
+			}
+		}
+		d.w.WriteHeader(http.StatusOK)
+		d.written = true
+	}
 	return d.w.Write(p)
 }
 
