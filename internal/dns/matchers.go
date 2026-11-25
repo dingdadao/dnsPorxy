@@ -24,18 +24,21 @@ type YAMLMatcher struct {
 	keywords     map[string]string // 关键字匹配：DOMAIN-KEYWORD,baidu,dns
 	domains      map[string]string // 域名匹配：DOMAIN,example.com,dns
 	regexRules   map[string]string // 正则匹配：DOMAIN-REGEX,pattern,dns
-	defaultDNS   []string          // 本列表命中后使用的DNS服务器列表
+	// regexCompiled 加载时预编译的正则：匹配阶段不再 Compile（每次 Compile 是毫秒级开销）
+	regexCompiled map[string]*regexp.Regexp
+	defaultDNS    []string // 本列表命中后使用的DNS服务器列表
 }
 
 // NewYAMLMatcher 创建YAML格式匹配器
 func NewYAMLMatcher(logger *utils.EnhancedLogger) *YAMLMatcher {
 	return &YAMLMatcher{
-		logger:       logger,
-		exactDomains: make(map[string]string),
-		suffixes:     make(map[string]string),
-		keywords:     make(map[string]string),
-		domains:      make(map[string]string),
-		regexRules:   make(map[string]string),
+		logger:        logger,
+		exactDomains:  make(map[string]string),
+		suffixes:      make(map[string]string),
+		keywords:      make(map[string]string),
+		domains:       make(map[string]string),
+		regexRules:    make(map[string]string),
+		regexCompiled: make(map[string]*regexp.Regexp),
 	}
 }
 
@@ -86,6 +89,9 @@ func (ym *YAMLMatcher) LoadYAMLConfig(configPath string) error {
 	newKeywords := make(map[string]string)
 	newDomains := make(map[string]string)
 	newRegexRules := make(map[string]string) // 正则表达式规则
+	// 规则 key 在加载时统一转小写：匹配阶段不再对每条规则做 ToLower（183 条后缀规则时
+	// 每次查询要做 183 次 ToLower+HasSuffix，实测 >100µs）
+	lowerRule := func(s string) string { return strings.ToLower(strings.TrimSpace(s)) }
 
 	var exactCount, suffixCount, keywordCount, domainCount, regexCount int
 
@@ -127,12 +133,12 @@ func (ym *YAMLMatcher) LoadYAMLConfig(configPath string) error {
 		case strings.HasPrefix(originalRulePattern, "DOMAIN-SUFFIX,"):
 			// DOMAIN-SUFFIX 规则：DOMAIN-SUFFIX,google.com
 			pattern := strings.TrimPrefix(rulePattern, "DOMAIN-SUFFIX,")
-			newSuffixes[pattern] = dnsServer
+			newSuffixes[lowerRule(pattern)] = dnsServer
 			suffixCount++
 		case strings.HasPrefix(originalRulePattern, "DOMAIN-KEYWORD,"):
 			// DOMAIN-KEYWORD 规则：DOMAIN-KEYWORD,baidu
 			pattern := strings.TrimPrefix(rulePattern, "DOMAIN-KEYWORD,")
-			newKeywords[pattern] = dnsServer
+			newKeywords[lowerRule(pattern)] = dnsServer
 			keywordCount++
 		case strings.HasPrefix(originalRulePattern, "DOMAIN-REGEX,"):
 			// DOMAIN-REGEX 规则：DOMAIN-REGEX,pattern
@@ -142,17 +148,31 @@ func (ym *YAMLMatcher) LoadYAMLConfig(configPath string) error {
 		case strings.HasPrefix(originalRulePattern, "DOMAIN,"):
 			// DOMAIN 规则：DOMAIN,example.com
 			pattern := strings.TrimPrefix(rulePattern, "DOMAIN,")
-			newDomains[pattern] = dnsServer
+			newDomains[lowerRule(pattern)] = dnsServer
 			domainCount++
 		case strings.HasPrefix(rule, "+."):
 			// 通配符格式：+.example.com 等同于 DOMAIN-SUFFIX,example.com
-			newSuffixes[strings.TrimPrefix(rule, "+.")] = dnsServer
+			newSuffixes[lowerRule(strings.TrimPrefix(rule, "+."))] = dnsServer
 			suffixCount++
 		default:
 			// 默认为精确匹配
-			newExactDomains[rulePattern] = dnsServer
+			newExactDomains[lowerRule(rulePattern)] = dnsServer
 			exactCount++
 		}
+	}
+
+	// 预编译正则：编译失败只记一次告警，匹配阶段不再反复失败
+	newRegexCompiled := make(map[string]*regexp.Regexp, len(newRegexRules))
+	for pattern := range newRegexRules {
+		re, err := regexp.Compile(pattern)
+		if err != nil {
+			ym.logger.Warn("正则表达式编译失败，该规则已跳过", map[string]interface{}{
+				"pattern": pattern,
+				"error":   err.Error(),
+			})
+			continue
+		}
+		newRegexCompiled[pattern] = re
 	}
 
 	// 原子性更新索引结构
@@ -162,6 +182,7 @@ func (ym *YAMLMatcher) LoadYAMLConfig(configPath string) error {
 	ym.keywords = newKeywords
 	ym.domains = newDomains
 	ym.regexRules = newRegexRules // 添加正则表达式规则
+	ym.regexCompiled = newRegexCompiled
 	ym.mu.Unlock()
 
 	ym.logger.Info("🎯 YAML格式域名配置加载完成", map[string]interface{}{
@@ -206,35 +227,33 @@ func (ym *YAMLMatcher) MatchDomain(domain string) ([]string, bool) {
 		return resolve(dns), true
 	}
 
-	// 3. 后缀匹配检查
-	for suffix, dns := range ym.suffixes {
-		if strings.HasSuffix(domainLower, "."+strings.ToLower(suffix)) || domainLower == strings.ToLower(suffix) {
+	// 3. 后缀匹配检查：按域名标签逐级向上查（a.b.example.com → b.example.com → example.com → com），
+	// 只做「标签数」次 map 查找。旧实现对每条后缀规则做 ToLower+HasSuffix，
+	// 定向域名列表 183 条后缀时一次未命中查询就要 >100µs。
+	start := 0
+	for {
+		candidate := domainLower[start:]
+		if dns, exists := ym.suffixes[candidate]; exists {
 			return resolve(dns), true
 		}
+		next := strings.IndexByte(candidate, '.')
+		if next < 0 || next+1 >= len(candidate) {
+			break
+		}
+		start += next + 1
 	}
 
-	// 4. 关键字匹配检查
+	// 4. 关键字匹配检查（key 已小写）
 	for keyword, dns := range ym.keywords {
-		if strings.Contains(domainLower, strings.ToLower(keyword)) {
+		if strings.Contains(domainLower, keyword) {
 			return resolve(dns), true
 		}
 	}
 
-	// 5. 正则表达式匹配检查
-	for pattern, dns := range ym.regexRules {
-		// 编译正则表达式
-		regex, err := regexp.Compile(pattern)
-		if err != nil {
-			ym.logger.Warn("正则表达式编译失败", map[string]interface{}{
-				"pattern": pattern,
-				"error":   err.Error(),
-			})
-			continue
-		}
-
-		// 检查是否匹配
+	// 5. 正则表达式匹配检查（加载时已预编译）
+	for pattern, regex := range ym.regexCompiled {
 		if regex.MatchString(domainLower) {
-			return resolve(dns), true
+			return resolve(ym.regexRules[pattern]), true
 		}
 	}
 
