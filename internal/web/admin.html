@@ -620,7 +620,14 @@ const SECTIONS = [
         help:"缓存条目过期后仍在该时长内返回旧响应（TTL 压到 5s），超出才按未命中由本次请求同步回源；填 0 关闭该行为" },
     ]},
     { kind:"advanced", title:"缓存容量（修改需重启进程）", body:[
-      { id:"cache.max_items", label:"最大缓存条目数", type:"number", restart:true },
+      { id:"cache.max_items", label:"最大缓存条目数（0＝不设条数上限）", type:"number", restart:true,
+        help:"填 0 时不按条数限制，容量由下面的「缓存内存预算」自适应决定（预算 ÷ 实测平均条目 ≈ 可存条数）；填正数时取「条数」与「预算反推值」中较小者。默认 0。" },
+      { id:"cache.memory_budget_mb", label:"缓存内存预算（MB）", type:"number",
+        help:"按预算 ÷ 实测平均条目大小反推容量：默认 64MB ≈ 17.8 万条（实测平均约 376 字节）。填 0 表示不启用自适应，只受「最大缓存条目数」限制；两者都为 0 时后端会补 64MB 兜底。保存即热更新，清理协程每 5 分钟按真实数据重算。" },
+      { id:"cache.min_ttl", label:"TTL 下限（min_ttl）", type:"duration", placeholder:"10s",
+        help:"上游给的有效 TTL 低于它时按它缓存并下发；留空/0＝不启用。负缓存（NXDOMAIN/无答案）不受下限影响，避免错误结果粘住（RFC 2308）。缓存命中时 TTL 仍按经过时长递减，不会被抬回。" },
+      { id:"cache.max_ttl", label:"TTL 上限（max_ttl）", type:"duration", placeholder:"24h",
+        help:"上游给的有效 TTL 高于它时压到该值；留空/0＝不启用。与 min_ttl 同时启用时必须 min ≤ max，否则保存会被拒绝。" },
       { id:"cache.max_async_workers", label:"异步刷新线程数", type:"number", restart:true },
     ]},
   ]},
@@ -678,8 +685,9 @@ function humanDur(s) {
 function humanizeConfig(c) {
   const durs = ["timeout","modern_timeout","query_timeout","replace_cache_time","network_refresh","doh3_quic_max_idle","doh3_quic_keepalive"];
   durs.forEach(k => { if (c[k]) c[k] = humanDur(c[k]); });
-  if (c.cache && c.cache.ttl) c.cache.ttl = humanDur(c.cache.ttl);
-  if (c.cache && c.cache.stale_ttl) c.cache.stale_ttl = humanDur(c.cache.stale_ttl);
+  if (c.cache) ["ttl","stale_ttl","min_ttl","max_ttl"].forEach(k => {
+    if (c.cache[k]) c.cache[k] = humanDur(c.cache[k]);
+  });
   if (c.query_log && c.query_log.retention) c.query_log.retention = humanDur(c.query_log.retention);
   if (!Array.isArray(c.split_lists)) c.split_lists = [];
   /* 全局默认解析模式：空值按「并发竞速」归一化 */
@@ -1046,7 +1054,16 @@ function splitListEditorHTML(items) {
         <button type="button" role="switch" aria-checked="${!!(l.ecs||{}).enabled}" class="switch"
           data-sl-ecs="${i}" aria-label="向上游注入 EDNS 客户端子网"></button>
       </div>
-      ${(l.ecs||{}).enabled ? `<div class="grid">
+      <div class="sl-opt">
+        <div class="txt">
+          <span>ECS 按真实客户端 IP 自动推导（auto）</span>
+          <small>开启后忽略下面的线路类型与地址段，按本次查询还原的真实客户端 IP 推导前缀（IPv4 /24、IPv6 /56，RFC 7871 建议值）；内网/回环/链路本地源不注入。不同网段的结果会分别缓存，不会互相串味。</small>
+        </div>
+        <button type="button" role="switch" aria-checked="${!!(l.ecs||{}).auto}" class="switch"
+          data-sl-ecs-auto="${i}" aria-label="ECS 按真实客户端 IP 自动推导"></button>
+      </div>
+      ${(l.ecs||{}).enabled && (l.ecs||{}).auto ? `<div class="help" style="padding:0 18px 10px">自动模式下线路类型与地址段不生效，无需填写。</div>` : ""}
+      ${(l.ecs||{}).enabled && !(l.ecs||{}).auto ? `<div class="grid">
         <div class="field">
           <label for="sl_${i}_ecs_isp"><span class="dirty-dot"></span>线路类型</label>
           <select id="sl_${i}_ecs_isp" data-sl-idx="${i}" data-sl-field="ecs.isp_type">
@@ -1110,6 +1127,7 @@ function normGroupAdvanced(g) {
       enabled: !!ecs.enabled,
       isp_type: String(ecs.isp_type || "").trim() || "telecom",
       subnet: String(ecs.subnet || "").trim(),
+      auto: !!ecs.auto,
     },
     cloud_replace: normCloudReplace(g.cloud_replace),
   };
@@ -1250,7 +1268,16 @@ function groupECSHTML(kind, i, ecs) {
       <button type="button" role="switch" aria-checked="${!!e.enabled}" class="switch"
         data-cg-kind="${kind}" data-cg-idx="${i}" data-cg-field="ecs.enabled" aria-label="ECS 注入开关"></button>
     </div>
-    ${e.enabled ? `<div class="grid">
+    <div class="sl-opt">
+      <div class="txt">
+        <span>按真实客户端 IP 自动推导（auto）</span>
+        <small>开启后忽略下面的线路类型与地址段，按本次查询的真实客户端 IP 推导前缀（IPv4 /24、IPv6 /56）；内网/回环源不注入。不同网段的结果分别缓存。</small>
+      </div>
+      <button type="button" role="switch" aria-checked="${!!e.auto}" class="switch"
+        data-cg-kind="${kind}" data-cg-idx="${i}" data-cg-field="ecs.auto" aria-label="ECS 按真实客户端 IP 自动推导"></button>
+    </div>
+    ${e.enabled && e.auto ? `<div class="help" style="padding:0 18px 10px">自动模式下线路类型与地址段不生效，无需填写。</div>` : ""}
+    ${e.enabled && !e.auto ? `<div class="grid">
       <div class="field">
         <label><span class="dirty-dot"></span>线路类型</label>
         <select data-cg-kind="${kind}" data-cg-idx="${i}" data-cg-field="ecs.isp_type">${ispOpts}</select>
@@ -1570,8 +1597,8 @@ function validateSplitLists(errors) {
     const ref = String(l.refresh || "").trim();
     if (ref && !DUR_RE.test(ref)) errors[`${i}.refresh`] = "时长格式无效，示例：30m、24h";
     const ecs = l.ecs || {};
-    if (ecs.enabled) {
-      if (!ECS_TYPES.some(t => t.v === ecs.isp_type)) errors[`${i}.ecs.isp_type`] = "请选择线路类型";
+    if (ecs.enabled && !ecs.auto) {
+      if (!ECS_TYPES.some(t => t.v === ecs.isp_type)) errors[`${i}.ecs.isp_type`] = "请选择线路类型（或打开 ECS 自动推导）";
       const subnet = String(ecs.subnet || "").trim();
       if (!subnet) errors[`${i}.ecs.subnet`] = "请填写本地公网 IP 或 CIDR";
       else if (!ecsSubnetValid(subnet)) errors[`${i}.ecs.subnet`] = "格式无效，示例：1.2.3.0/24、240e:1:2::/32";
@@ -1599,7 +1626,8 @@ function validateClientGroups(errors) {
     const fb = asArray(g.fallback_dns);
     if (!refs.length && !fb.length) errors[`isp${i}.split_refs`] = "启用后需引用分流列表或配置兜底 DNS 之一";
     else checkDNS("isp", i, fb);
-    if ((g.ecs || {}).enabled && !ecsSubnetValid((g.ecs || {}).subnet)) {
+    const gEcsIsp = g.ecs || {};
+    if (gEcsIsp.enabled && !gEcsIsp.auto && !ecsSubnetValid(gEcsIsp.subnet)) {
       errors[`isp${i}.ecs.subnet`] = "格式无效，示例：1.2.3.0/24、240e:1:2::/32";
     }
     const api = String((g.cloud_replace || {}).cf_api || "").trim();
@@ -1619,7 +1647,8 @@ function validateClientGroups(errors) {
     const fb = asArray(g.fallback_dns);
     if (!refs.length && !fb.length) errors[`custom${i}.split_refs`] = "启用后需引用分流列表或配置兜底 DNS 之一";
     else checkDNS("custom", i, fb);
-    if ((g.ecs || {}).enabled && !ecsSubnetValid((g.ecs || {}).subnet)) {
+    const gEcsCustom = g.ecs || {};
+    if (gEcsCustom.enabled && !gEcsCustom.auto && !ecsSubnetValid(gEcsCustom.subnet)) {
       errors[`custom${i}.ecs.subnet`] = "格式无效，示例：1.2.3.0/24、240e:1:2::/32";
     }
     const api = String((g.cloud_replace || {}).cf_api || "").trim();
@@ -1687,6 +1716,7 @@ async function saveSections(secs) {
       enabled: !!(g.ecs || {}).enabled,
       isp_type: String((g.ecs || {}).isp_type || "").trim() || "telecom",
       subnet: String((g.ecs || {}).subnet || "").trim(),
+      auto: !!(g.ecs || {}).auto,
     },
     cloud_replace: normCloudReplace(g.cloud_replace),
   }));
@@ -1703,6 +1733,7 @@ async function saveSections(secs) {
       enabled: !!(g.ecs || {}).enabled,
       isp_type: String((g.ecs || {}).isp_type || "").trim() || "telecom",
       subnet: String((g.ecs || {}).subnet || "").trim(),
+      auto: !!(g.ecs || {}).auto,
     },
     cloud_replace: normCloudReplace(g.cloud_replace),
   }));
@@ -2399,6 +2430,20 @@ document.addEventListener("click", async e => {
     }
     return;
   }
+  const slEcsAuto = e.target.closest("[data-sl-ecs-auto]");
+  if (slEcsAuto) {
+    const i = Number(slEcsAuto.dataset.slEcsAuto);
+    const item = CFG.split_lists[i];
+    if (item) {
+      if (!item.ecs) item.ecs = { enabled:true, isp_type:"", subnet:"", auto:true };
+      item.ecs.auto = !item.ecs.auto;
+      /* 打开自动模式时顺带把注入开关打开：auto 的语义就是「按客户端 IP 注入」 */
+      if (item.ecs.auto) item.ecs.enabled = true;
+      renderRoute();
+      $(`[data-sl-ecs-auto="${i}"]`)?.focus();
+    }
+    return;
+  }
   const slEcs = e.target.closest("[data-sl-ecs]");
   if (slEcs) {
     const i = Number(slEcs.dataset.slEcs);
@@ -2484,6 +2529,19 @@ document.addEventListener("click", async e => {
     if (item) {
       item.ecs = item.ecs || {};
       item.ecs.enabled = !item.ecs.enabled;
+      renderRoute();
+    }
+    return;
+  }
+  /* 分组「ECS 按真实客户端 IP 自动推导」开关：按钮只触发 click，需单独处理 */
+  const ecsAutoBtn = e.target.closest('button[data-cg-field="ecs.auto"]');
+  if (ecsAutoBtn) {
+    const item = groupAt(ecsAutoBtn.dataset.cgKind, Number(ecsAutoBtn.dataset.cgIdx));
+    if (item) {
+      item.ecs = item.ecs || {};
+      item.ecs.auto = !item.ecs.auto;
+      /* 打开自动模式时顺带把注入开关打开（auto 的语义就是按客户端 IP 注入） */
+      if (item.ecs.auto) item.ecs.enabled = true;
       renderRoute();
     }
     return;
