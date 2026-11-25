@@ -130,6 +130,12 @@ func (cm *CacheManager) ApplyTTLBounds(msg *dns.Msg) bool {
 	return cm.cache.applyTTLBounds(msg)
 }
 
+// ApplyTTLUpperBound 只施加 max_ttl：缓存命中响应的 TTL 已按缓存时长递减，
+// 出口不得再被 min_ttl 抬高（否则客户端缓存的 TTL 会超过条目本身剩余寿命）。
+func (cm *CacheManager) ApplyTTLUpperBound(msg *dns.Msg) bool {
+	return cm.cache.applyTTLUpperBound(msg)
+}
+
 // Get 获取缓存（默认 scope "-"）
 func (cm *CacheManager) Get(domain string, qtype uint16) (*dns.Msg, bool, bool, int) {
 	return cm.GetScoped("-", domain, qtype)

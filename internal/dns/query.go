@@ -26,8 +26,9 @@ func (h *RefactoredHandler) proxyQuery(req *dns.Msg, upstreams []string) (*dns.M
 var errQueryBudgetExceeded = errors.New("query exceeded total timeout budget")
 
 // runWithBudget 给一次上游解析施加硬性总预算：budget<=0 时直接同步执行（历史行为）。
-// 到点即返回 errQueryBudgetExceeded，被放弃的解析 goroutine 会在自己的单台超时内自行结束，
-// 不会写回任何共享状态——这样串行模式也不会再出现「上游数 × 单台超时」的总耗时。
+// 到点即返回 errQueryBudgetExceeded，被放弃的解析 goroutine 会在自己的单台超时内自行结束。
+// 它可能已经（或稍后会）把正常应答写入缓存——这是可接受的：超时的这一次请求仍会拿到失败，
+// 只是后续请求会命中托管结果；真正的取消传播（ctx）尚未贯穿优化器，属已知限制。
 func runWithBudget(budget time.Duration, onExpire func(), fn func() (upstreamAnswer, error)) (upstreamAnswer, error) {
 	if budget <= 0 {
 		return fn()
@@ -117,6 +118,17 @@ func (h *RefactoredHandler) resolveUpstream(req *dns.Msg, upstreams []string, mo
 	return result.FastestResult.Response, result.FastestResult.Server, nil
 }
 
+// upstreamContext 把「总查询超时预算」变成可取消上下文：预算到点时真正中止在途上游请求，
+// 而不是只让调用方不再等待——否则被放弃的 goroutine 会继续跑到单台超时，
+// 上游变慢时客户端请求量仍会按「上游数 × 并发」放大。
+// budget<=0 表示未配置总预算，只提供取消能力（供 defer cancel 释放资源）。
+func (h *RefactoredHandler) upstreamContext(budget time.Duration) (context.Context, context.CancelFunc) {
+	if budget > 0 {
+		return context.WithTimeout(context.Background(), budget)
+	}
+	return context.WithCancel(context.Background())
+}
+
 // queryBackupDNS 用备份DNS做单台兜底查询，成功返回响应与 true
 func (h *RefactoredHandler) queryBackupDNS(req *dns.Msg) (*dns.Msg, bool) {
 	backup := h.getConfig().BackupDNS
@@ -145,16 +157,20 @@ func (h *RefactoredHandler) queryBackupDNS(req *dns.Msg) (*dns.Msg, bool) {
 // failover/wrandom 仅现代优化器支持（传统优化器为旧格式 host:port 的兼容路径，不支持模式选择）
 // budget>0 时串行模式会在预算耗尽前停止发起新的上游尝试
 func (h *RefactoredHandler) queryUpstream(req *dns.Msg, upstreams []string, mode string, budget time.Duration) *ConcurrentQueryResult {
+	ctx, cancel := h.upstreamContext(budget)
+	defer cancel()
+
 	if modernOptimizer, ok := h.queryOptimizer.(*SimpleModernOptimizer); ok {
 		switch mode {
 		case config.DNSModeFailover:
-			return modernOptimizer.queryFailover(req, upstreams, budget)
+			return modernOptimizer.QueryFailoverCtx(ctx, req, upstreams, budget)
 		case config.DNSModeWRandom:
-			return modernOptimizer.QueryWeightedRandom(req, upstreams)
+			return modernOptimizer.QueryWeightedRandomCtx(ctx, req, upstreams)
 		default:
-			return modernOptimizer.Query(req, upstreams)
+			return modernOptimizer.QueryCtx(ctx, req, upstreams)
 		}
 	}
+	// 传统优化器（旧格式 host:port 兼容路径）没有 ctx 版本，保持原行为
 	if traditionalOptimizer, ok := h.queryOptimizer.(*FastQueryOptimizer); ok {
 		return traditionalOptimizer.Query(req, upstreams)
 	}

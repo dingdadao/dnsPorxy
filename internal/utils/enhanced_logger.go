@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"reflect"
 	"runtime"
 	"sync"
 	"time"
@@ -165,11 +166,55 @@ func (l *EnhancedLogger) getCallerInfo() (string, string, int) {
 	return function, file, line
 }
 
+// normalizeFields 把日志字段里的 error 值转成字符串。
+// 直接对 error 接口做 json.Marshal 只会得到 {}（如 *net.OpError、*url.Error 都没有导出字段），
+// 日志里就只剩 "error":{}，排障时最关键的失败原因全部丢失。
+func normalizeFields(fields map[string]interface{}) map[string]interface{} {
+	if len(fields) == 0 {
+		return fields
+	}
+	changed := false
+	for _, v := range fields {
+		if v == nil {
+			continue
+		}
+		if _, isErr := v.(error); isErr {
+			changed = true
+			break
+		}
+	}
+	if !changed {
+		return fields
+	}
+	out := make(map[string]interface{}, len(fields))
+	for k, v := range fields {
+		out[k] = normalizeFieldValue(v)
+	}
+	return out
+}
+
+// normalizeFieldValue 单个字段值的归一化：error → err.Error()
+func normalizeFieldValue(v interface{}) interface{} {
+	err, ok := v.(error)
+	if !ok {
+		return v
+	}
+	rv := reflect.ValueOf(err)
+	switch rv.Kind() {
+	case reflect.Ptr, reflect.Interface, reflect.Map, reflect.Slice, reflect.Func, reflect.Chan:
+		if rv.IsNil() {
+			return nil
+		}
+	}
+	return err.Error()
+}
+
 // log 通用日志方法
 func (l *EnhancedLogger) log(level LogLevel, message string, fields map[string]interface{}, duration *time.Duration) {
 	if level < l.getLevel() {
 		return
 	}
+	fields = normalizeFields(fields)
 
 	function, file, line := l.getCallerInfo()
 

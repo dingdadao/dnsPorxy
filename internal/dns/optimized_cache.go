@@ -60,6 +60,7 @@ func (e *CacheEntry) lastAccessTime() time.Time { return time.Unix(0, e.lastAcce
 
 // CacheShard 缓存分片
 type CacheShard struct {
+	idx         int // 分片序号：用于把总容量的余数分配到前几个分片
 	mu          sync.RWMutex
 	store       map[string]*CacheEntry
 	flightGroup singleflight.Group
@@ -129,15 +130,13 @@ const minDynamicCapacity = 1000
 
 // NewOptimizedDNSCache 创建一个新的优化DNS缓存系统
 func NewOptimizedDNSCache(maxSize int, defaultTTL time.Duration) *OptimizedDNSCache {
-	// 确定分片数量，根据CPU核心数或固定值
-	shardCount := 16
-	if shardCount <= 0 {
-		shardCount = 8 // 默认8个分片
-	}
+	// 分片数固定 16：分片越多每片容量下限越小，小容量配置会更难生效
+	const shardCount = 16
 
 	shards := make([]*CacheShard, shardCount)
 	for i := 0; i < shardCount; i++ {
 		shards[i] = &CacheShard{
+			idx:         i,
 			store:       make(map[string]*CacheEntry),
 			flightGroup: singleflight.Group{},
 		}
@@ -187,6 +186,31 @@ func (c *OptimizedDNSCache) SetMemoryBudget(budget int64) {
 // capacity 返回当前生效容量
 func (c *OptimizedDNSCache) capacity() int {
 	return int(c.maxSize.Load())
+}
+
+// shardCapacity 单分片容量上限：总容量的余数分配给前几个分片，使各片之和恰好等于总容量
+// （旧实现直接用 cap/shardCount 会丢掉余数：max_items=5000 实际只能存 4992 条）。
+// 容量小于分片数时每片至少 1 条——否则会算出 0，使「len(store) >= 0」恒真、每次写入都淘汰，
+// 配置的小容量根本无法生效。
+func (c *OptimizedDNSCache) shardCapacity(idx int) int {
+	cap := c.capacity()
+	if cap <= 0 {
+		return 0 // 不限容量
+	}
+	per, rem := cap/c.shardCount, cap%c.shardCount
+	if idx >= 0 && idx < rem {
+		per++
+	}
+	if per < 1 {
+		per = 1
+	}
+	return per
+}
+
+// needEvict 写入前是否需要淘汰（容量为 0 表示不限，永不淘汰）
+func (c *OptimizedDNSCache) needEvict(shard *CacheShard) bool {
+	per := c.shardCapacity(shard.idx)
+	return per > 0 && len(shard.store) >= per
 }
 
 // recalcCapacity 按内存预算与实测平均条目大小重算容量。
@@ -259,6 +283,18 @@ func (c *OptimizedDNSCache) clampTTL(ttl time.Duration) time.Duration {
 // 只在 Set 里改过期时间是不够的。
 // 返回是否发生了改写。
 func (c *OptimizedDNSCache) applyTTLBounds(msg *dns.Msg) bool {
+	return c.applyTTLBoundsOpt(msg, true)
+}
+
+// applyTTLUpperBound 只施加 max_ttl，不动下限。
+// 用于「缓存命中」的响应出口：命中的 TTL 已经按缓存时长递减，若出口再按 min_ttl 抬回去，
+// 客户端会把记录缓存得比服务端条目更久（也会和 wire 快路径的递减结果不一致）。
+func (c *OptimizedDNSCache) applyTTLUpperBound(msg *dns.Msg) bool {
+	return c.applyTTLBoundsOpt(msg, false)
+}
+
+// applyTTLBoundsOpt allowMin=false 时只压上限（缓存命中路径），true 时上下限都施加（上游新鲜响应）。
+func (c *OptimizedDNSCache) applyTTLBoundsOpt(msg *dns.Msg, allowMin bool) bool {
 	if msg == nil {
 		return false
 	}
@@ -278,7 +314,7 @@ func (c *OptimizedDNSCache) applyTTLBounds(msg *dns.Msg) bool {
 	}
 
 	// 负缓存（NXDOMAIN / 无答案）不施加下限，否则错误结果会粘住很久（RFC 2308）
-	applyMin := msg.Rcode == dns.RcodeSuccess && len(msg.Answer) > 0
+	applyMin := allowMin && msg.Rcode == dns.RcodeSuccess && len(msg.Answer) > 0
 
 	changed := false
 	rewrite := func(rrs []dns.RR) {
@@ -627,7 +663,7 @@ func (c *OptimizedDNSCache) SetCloudResponse(scope, domain string, qType uint16,
 	defer shard.mu.Unlock()
 
 	// 检查是否需要清理缓存
-	if cap := c.capacity(); cap > 0 && len(shard.store) >= cap/c.shardCount {
+	if c.needEvict(shard) {
 		c.evictLeastRecentlyUsed(shard)
 	}
 
@@ -875,7 +911,7 @@ func (c *OptimizedDNSCache) Set(scope, domain string, qType uint16, response *dn
 		defer shard.mu.Unlock()
 
 		// 检查是否需要清理缓存
-		if cap := c.capacity(); cap > 0 && len(shard.store) >= cap/c.shardCount {
+		if c.needEvict(shard) {
 			c.evictLeastRecentlyUsed(shard)
 		}
 
@@ -959,7 +995,7 @@ func (c *OptimizedDNSCache) Set(scope, domain string, qType uint16, response *dn
 	defer shard.mu.Unlock()
 
 	// 检查容量，如果达到上限，删除最少访问的条目
-	if cap := c.capacity(); cap > 0 && len(shard.store) >= cap/c.shardCount {
+	if c.needEvict(shard) {
 		c.evictLeastRecentlyUsed(shard)
 	}
 
@@ -978,7 +1014,7 @@ func (c *OptimizedDNSCache) SetWithTTL(scope, domain string, qType uint16, respo
 		defer shard.mu.Unlock()
 
 		// 检查是否需要清理缓存
-		if cap := c.capacity(); cap > 0 && len(shard.store) >= cap/c.shardCount {
+		if c.needEvict(shard) {
 			c.evictLeastRecentlyUsed(shard)
 		}
 
@@ -1053,7 +1089,7 @@ func (c *OptimizedDNSCache) SetWithTTL(scope, domain string, qType uint16, respo
 	defer shard.mu.Unlock()
 
 	// 检查容量，如果达到上限，删除最少访问的条目
-	if cap := c.capacity(); cap > 0 && len(shard.store) >= cap/c.shardCount {
+	if c.needEvict(shard) {
 		c.evictLeastRecentlyUsed(shard)
 	}
 
@@ -1143,6 +1179,12 @@ func (c *OptimizedDNSCache) asyncRefresh(domain string, qType uint16, refreshFn 
 }
 
 // evictLeastRecentlyUsed 淘汰最少使用的条目
+// evictSampleSize 每次淘汰最多扫描的条目数。
+// 全扫一遍（旧实现）的代价与分片条目数成正比：实测满容量写入 5000 条时 3.8µs、
+// 10 万条时 85µs，而默认容量自适应后会到 ~17.8 万条（每片 1.1 万），
+// 高 QPS 冷写入期会把淘汰扫描放大成 CPU 热点。随机采样 32 条取最旧即可逼近 LRU。
+const evictSampleSize = 32
+
 func (c *OptimizedDNSCache) evictLeastRecentlyUsed(shard *CacheShard) {
 	if len(shard.store) == 0 {
 		return
@@ -1151,12 +1193,17 @@ func (c *OptimizedDNSCache) evictLeastRecentlyUsed(shard *CacheShard) {
 	var oldestKey string
 	var oldestTime time.Time
 
-	// 找到最久未访问的条目
+	// 找到最久未访问的条目（map 迭代顺序随机，采样 32 条足够近似）
+	scanned := 0
 	for key, entry := range shard.store {
 		la := entry.lastAccessTime()
 		if oldestKey == "" || la.Before(oldestTime) {
 			oldestKey = key
 			oldestTime = la
+		}
+		scanned++
+		if scanned >= evictSampleSize {
+			break
 		}
 	}
 

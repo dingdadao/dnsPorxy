@@ -134,6 +134,12 @@ func (qo *SimpleModernOptimizer) initHTTPClient() {
 
 // Query 执行并发DNS查询（简化版本）
 func (qo *SimpleModernOptimizer) Query(req *dns.Msg, upstreams []string) *ConcurrentQueryResult {
+	return qo.QueryCtx(context.Background(), req, upstreams)
+}
+
+// QueryCtx 带取消的并发竞速查询：ctx 到期会立即中止在途上游请求（含 UDP/TCP 连接），
+// 而不是像旧实现那样让被放弃的请求继续跑到单台超时。
+func (qo *SimpleModernOptimizer) QueryCtx(ctx context.Context, req *dns.Msg, upstreams []string) *ConcurrentQueryResult {
 	if len(upstreams) == 0 {
 		return &ConcurrentQueryResult{
 			FastestResult: &QueryResult{
@@ -143,7 +149,7 @@ func (qo *SimpleModernOptimizer) Query(req *dns.Msg, upstreams []string) *Concur
 		}
 	}
 
-	return qo.concurrentQuery(req, upstreams)
+	return qo.concurrentQueryCtx(ctx, req, upstreams)
 }
 
 // ServerStats 服务器统计信息
@@ -157,6 +163,11 @@ type ServerStats struct {
 
 // concurrentQuery 并发查询多个上游服务器
 func (qo *SimpleModernOptimizer) concurrentQuery(req *dns.Msg, upstreams []string) *ConcurrentQueryResult {
+	return qo.concurrentQueryCtx(context.Background(), req, upstreams)
+}
+
+// concurrentQueryCtx 并发查询多个上游服务器（ctx 到期即中止在途请求）
+func (qo *SimpleModernOptimizer) concurrentQueryCtx(ctx context.Context, req *dns.Msg, upstreams []string) *ConcurrentQueryResult {
 	start := time.Now()
 
 	// 过滤有效的上游服务器
@@ -178,7 +189,7 @@ func (qo *SimpleModernOptimizer) concurrentQuery(req *dns.Msg, upstreams []strin
 			"domain": req.Question[0].Name,
 		})
 
-		result := qo.queryServer(req, server)
+		result := qo.queryServerCtx(ctx, req, server)
 
 		// 添加空指针检查
 		if result == nil {
@@ -285,7 +296,7 @@ func (qo *SimpleModernOptimizer) concurrentQuery(req *dns.Msg, upstreams []strin
 				wg.Done()
 			}()
 
-			result := qo.queryServer(req, server)
+			result := qo.queryServerCtx(ctx, req, server)
 			select {
 			case resultChan <- result:
 			case <-ctx.Done():
@@ -524,9 +535,19 @@ func (qo *SimpleModernOptimizer) QueryFailover(req *dns.Msg, upstreams []string)
 	return qo.queryFailover(req, upstreams, 0)
 }
 
+// QueryFailoverCtx 带取消的串行故障转移：ctx 到期后不再发起新的上游尝试。
+func (qo *SimpleModernOptimizer) QueryFailoverCtx(ctx context.Context, req *dns.Msg, upstreams []string, budget time.Duration) *ConcurrentQueryResult {
+	return qo.queryFailoverCtx(ctx, req, upstreams, budget)
+}
+
 // queryFailover 串行模式的实现。budget>0 时整次串行尝试受总预算约束：
 // 每发起一台之前先看剩余时间，已耗尽就不再发新请求，避免总耗时按「上游数 × 单台超时」膨胀。
 func (qo *SimpleModernOptimizer) queryFailover(req *dns.Msg, upstreams []string, budget time.Duration) *ConcurrentQueryResult {
+	return qo.queryFailoverCtx(context.Background(), req, upstreams, budget)
+}
+
+// queryFailoverCtx 串行模式实现：预算耗尽或 ctx 取消后都不再发起新的上游请求。
+func (qo *SimpleModernOptimizer) queryFailoverCtx(ctx context.Context, req *dns.Msg, upstreams []string, budget time.Duration) *ConcurrentQueryResult {
 	start := time.Now()
 
 	validUpstreams := qo.filterValidUpstreams(upstreams)
@@ -543,7 +564,15 @@ func (qo *SimpleModernOptimizer) queryFailover(req *dns.Msg, upstreams []string,
 	var last *QueryResult
 
 	for i, server := range validUpstreams {
-		// 预算耗尽：不再发起新的上游请求，直接把已收集的结果交回调用方
+		// 预算耗尽或调用方已取消：不再发起新的上游请求，直接把已收集的结果交回调用方
+		if ctx.Err() != nil {
+			qo.logger.Debug("⏹️ 串行模式被取消，提前结束", map[string]interface{}{
+				"attempted":  len(allResults),
+				"total":      len(validUpstreams),
+				"total_time": time.Since(start).String(),
+			})
+			break
+		}
 		if budget > 0 && time.Since(start) >= budget {
 			qo.logger.Debug("⏰ 串行模式总预算耗尽，提前结束", map[string]interface{}{
 				"budget":     budget.String(),
@@ -553,7 +582,7 @@ func (qo *SimpleModernOptimizer) queryFailover(req *dns.Msg, upstreams []string,
 			})
 			break
 		}
-		result := qo.queryServer(req, server)
+		result := qo.queryServerCtx(ctx, req, server)
 		if result == nil {
 			continue
 		}
@@ -683,6 +712,11 @@ const wrandomHedgeDelay = 100 * time.Millisecond
 // 先到的有效应答即返回。最多尝试 2 台，避免单点故障或慢上游拖高整体时延。
 // 返回结构与 Query/QueryFailover 保持一致，便于上层统一处理。
 func (qo *SimpleModernOptimizer) QueryWeightedRandom(req *dns.Msg, upstreams []string) *ConcurrentQueryResult {
+	return qo.QueryWeightedRandomCtx(context.Background(), req, upstreams)
+}
+
+// QueryWeightedRandomCtx 带取消的权重随机：ctx 到期立即返回，不再等对冲。
+func (qo *SimpleModernOptimizer) QueryWeightedRandomCtx(ctx context.Context, req *dns.Msg, upstreams []string) *ConcurrentQueryResult {
 	start := time.Now()
 
 	weighted := qo.parseWeightedUpstreams(upstreams)
@@ -742,7 +776,7 @@ func (qo *SimpleModernOptimizer) QueryWeightedRandom(req *dns.Msg, upstreams []s
 			resultChan <- wrandAttempt{
 				choice:  order[i],
 				attempt: i + 1,
-				result:  qo.queryServer(req, order[i].server),
+				result:  qo.queryServerCtx(ctx, req, order[i].server),
 			}
 		}()
 	}
@@ -761,6 +795,18 @@ func (qo *SimpleModernOptimizer) QueryWeightedRandom(req *dns.Msg, upstreams []s
 	for pending > 0 {
 		var done wrandAttempt
 		select {
+		case <-ctx.Done():
+			// 调用方已放弃（总预算耗尽）：立即返回已收集结果，不等剩余上游
+			if last == nil {
+				last = &QueryResult{Server: "none", Error: ctx.Err(), ResponseTime: time.Since(start)}
+			}
+			return &ConcurrentQueryResult{
+				FastestResult:  last,
+				AllResults:     allResults,
+				HasSuccess:     false,
+				FastestTime:    last.ResponseTime,
+				TotalQueryTime: time.Since(start),
+			}
 		case done = <-resultChan:
 			pending--
 		case <-hedge.C:
@@ -898,6 +944,11 @@ func (qo *SimpleModernOptimizer) isValidUpstream(upstream string) bool {
 
 // queryServer 查询特定服务器（根据URL scheme自动选择协议）
 func (qo *SimpleModernOptimizer) queryServer(req *dns.Msg, server string) *QueryResult {
+	return qo.queryServerCtx(context.Background(), req, server)
+}
+
+// queryServerCtx 单台上游查询（ctx 用于取消在途请求）
+func (qo *SimpleModernOptimizer) queryServerCtx(ctx context.Context, req *dns.Msg, server string) *QueryResult {
 	start := time.Now()
 
 	var resp *dns.Msg
@@ -913,7 +964,7 @@ func (qo *SimpleModernOptimizer) queryServer(req *dns.Msg, server string) *Query
 		if qo.udpQueryFunc != nil {
 			resp, err = qo.udpQueryFunc(req, server)
 		} else {
-			resp, err = qo.queryUDP(req, server)
+			resp, err = qo.queryUDPCtx(ctx, req, server)
 		}
 	} else if strings.HasPrefix(server, "tcp://") {
 		protocol = "TCP"
@@ -922,7 +973,7 @@ func (qo *SimpleModernOptimizer) queryServer(req *dns.Msg, server string) *Query
 		if qo.tcpQueryFunc != nil {
 			resp, err = qo.tcpQueryFunc(req, server)
 		} else {
-			resp, err = qo.queryTCP(req, server)
+			resp, err = qo.queryTCPCtx(ctx, req, server)
 		}
 	} else if strings.HasPrefix(server, "https://") {
 		protocol = "DoH"
@@ -955,7 +1006,7 @@ func (qo *SimpleModernOptimizer) queryServer(req *dns.Msg, server string) *Query
 		// 兼容旧格式：传统UDP/TCP
 		protocol = "UDP/TCP"
 		timeout = qo.getTimeout()
-		resp, err = qo.queryTraditional(req, server)
+		resp, err = qo.queryTraditionalCtx(ctx, req, server)
 	}
 
 	result := &QueryResult{
@@ -988,28 +1039,49 @@ func (qo *SimpleModernOptimizer) queryServer(req *dns.Msg, server string) *Query
 
 // queryUDP 纯UDP查询
 func (qo *SimpleModernOptimizer) queryUDP(req *dns.Msg, serverURL string) (*dns.Msg, error) {
+	return qo.queryUDPCtx(context.Background(), req, serverURL)
+}
+
+// queryUDPCtx UDP 查询：外层 ctx 到期会立即中止连接（预算取消不再只是不等结果）
+func (qo *SimpleModernOptimizer) queryUDPCtx(ctx context.Context, req *dns.Msg, serverURL string) (*dns.Msg, error) {
 	// 归一化为 host:port（udp://1.1.1.1 → 1.1.1.1:53；IPv6 补成 [::1]:53）
 	// 不能用 strings.Contains(address, ":") 判断，否则 ::1 这类 IPv6 字面量会被误判为「已含端口」
 	address := config.UpstreamDialAddr(serverURL)
 
-	ctx, cancel := context.WithTimeout(context.Background(), qo.getTimeout())
+	ctx, cancel := context.WithTimeout(ctx, qo.getTimeout())
 	defer cancel()
 
+	// UDPSize=4096：读缓冲必须覆盖上游可能返回的完整报文。不设时 miekg 默认按 512 读，
+	// 客户端未带 EDNS、上游又不按 512 截断时（部分运营商/家用路由器 DNS 如此），
+	// 响应会因读缓冲不足而解包失败，被误判成「上游失败」直接 SERVFAIL。
 	client := &dns.Client{
 		Net:     "udp",
 		Timeout: qo.getTimeout(),
+		UDPSize: 4096,
 	}
 
 	resp, _, err := client.ExchangeContext(ctx, req, address)
+	if err != nil || (resp != nil && resp.Truncated) {
+		// UDP 失败或上游声明截断：按 RFC 1035 §4.2.2 用 TCP 重取一次。
+		// 预算已耗尽时 TCP 也会立即失败（同一个 deadline），不会放大总耗时。
+		if tcpResp, tcpErr := qo.queryTCPCtx(ctx, req, serverURL); tcpErr == nil && tcpResp != nil {
+			return tcpResp, nil
+		}
+	}
 	return resp, err
 }
 
 // queryTCP 纯TCP查询
 func (qo *SimpleModernOptimizer) queryTCP(req *dns.Msg, serverURL string) (*dns.Msg, error) {
+	return qo.queryTCPCtx(context.Background(), req, serverURL)
+}
+
+// queryTCPCtx TCP 查询（ctx 取消即中止连接）
+func (qo *SimpleModernOptimizer) queryTCPCtx(ctx context.Context, req *dns.Msg, serverURL string) (*dns.Msg, error) {
 	// 归一化为 host:port（tcp://1.1.1.1 → 1.1.1.1:53；IPv6 补成 [::1]:53）
 	address := config.UpstreamDialAddr(serverURL)
 
-	ctx, cancel := context.WithTimeout(context.Background(), qo.getTimeout())
+	ctx, cancel := context.WithTimeout(ctx, qo.getTimeout())
 	defer cancel()
 
 	client := &dns.Client{
@@ -1023,22 +1095,28 @@ func (qo *SimpleModernOptimizer) queryTCP(req *dns.Msg, serverURL string) (*dns.
 
 // queryTraditional 传统UDP/TCP查询（兼容旧格式）
 func (qo *SimpleModernOptimizer) queryTraditional(req *dns.Msg, server string) (*dns.Msg, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), qo.getTimeout())
+	return qo.queryTraditionalCtx(context.Background(), req, server)
+}
+
+// queryTraditionalCtx 旧格式（host:port）查询，ctx 取消即中止
+func (qo *SimpleModernOptimizer) queryTraditionalCtx(ctx context.Context, req *dns.Msg, server string) (*dns.Msg, error) {
+	ctx, cancel := context.WithTimeout(ctx, qo.getTimeout())
 	defer cancel()
 
 	// 旧格式可能仍带 scheme，统一归一化为 host:port 再 dial
 	address := config.UpstreamDialAddr(server)
 
-	// 优先尝试UDP
+	// 优先尝试UDP（UDPSize 覆盖完整响应，避免大报文解包失败）
 	client := &dns.Client{
 		Net:     "udp",
 		Timeout: qo.getTimeout(),
+		UDPSize: 4096,
 	}
 
 	resp, _, err := client.ExchangeContext(ctx, req, address)
 
-	// UDP失败时尝试TCP（可能是响应太大）
-	if err != nil && qo.enableFallback {
+	// UDP失败（响应过大/被截断）时尝试TCP
+	if (err != nil || (resp != nil && resp.Truncated)) && qo.enableFallback {
 		client.Net = "tcp"
 		resp, _, err = client.ExchangeContext(ctx, req, address)
 	}

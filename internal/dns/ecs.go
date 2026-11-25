@@ -120,6 +120,26 @@ func ecsDesc(msg *dns.Msg) string {
 	return fmt.Sprintf("%s/%d", s.Address.String(), s.SourceNetmask)
 }
 
+// cacheScopeFor 在客户端线路 scope 的基础上，为 ECS 自动模式再叠加一层「推导前缀」分区。
+//
+// 背景：ecs.auto 按真实客户端 IP 推导待注入的 ECS 前缀，同一个域名在 203.0.113.0/24 与
+// 198.51.100.0/24 可能解析出完全不同的就近结果。缓存键只有 (scope, domain, qtype)，
+// 若不把前缀计入 scope，先解析的网段会把结果串给后续所有网段，ECS 就失去意义。
+// 手动 ECS（固定 subnet）不需要分区：所有客户端拿到的本来就是同一份结果。
+func cacheScopeFor(scope string, d SplitDecision, clientIP netip.Addr) string {
+	if !d.Matched || !d.ECS.Enabled || !d.ECS.Auto {
+		return scope
+	}
+	p, ok := d.ECS.ResolveFrom(clientIP)
+	if !ok {
+		return scope // 内网/无效地址不注入 ECS，也就不需要分区
+	}
+	if scope == "" {
+		scope = "-"
+	}
+	return scope + "|ecs:" + p.String()
+}
+
 // buildReplaceQuery 构造云替换的第二跳回源请求（替换域名 / 其 CNAME 目标）。
 //
 // 该请求必须与主查询用同一套 ECS 语义，否则替换域名会按代理出口位置解析，

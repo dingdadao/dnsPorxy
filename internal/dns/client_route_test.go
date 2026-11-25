@@ -42,12 +42,12 @@ func routeCfg(t *testing.T) *config.Config {
 func TestResolveRouteNoClientGroup(t *testing.T) {
 	h := newRouteFixture(t, routeCfg(t))
 
-	d, up := h.resolveRoute("www.cn.example.com", ClientDecision{})
+	d, up := h.resolveRoute("www.cn.example.com", ClientDecision{}, true)
 	if !d.Matched || d.ListName != "国内" || up[0] != "udp://223.5.5.5:53" {
 		t.Fatalf("未命中分组时应走全局分流：%+v / %v", d, up)
 	}
 
-	_, up = h.resolveRoute("www.unknown.com", ClientDecision{})
+	_, up = h.resolveRoute("www.unknown.com", ClientDecision{}, true)
 	if up[0] != "udp://9.9.9.9:53" {
 		t.Fatalf("全局分流未命中时应回退全局上游，得到 %v", up)
 	}
@@ -68,18 +68,18 @@ func TestResolveRouteMatchedGroupReuseSplitThenFallback(t *testing.T) {
 	}
 
 	// 命中引用的「国内」分流列表 → 复用该列表的 DNS，不展开组兜底
-	d, up := h.resolveRoute("www.cn.example.com", cd)
+	d, up := h.resolveRoute("www.cn.example.com", cd, true)
 	if !d.Matched || d.ListName != "国内" || up[0] != "udp://223.5.5.5:53" {
 		t.Fatalf("命中引用分流应复用其 DNS：%+v / %v", d, up)
 	}
 
-	d, up = h.resolveRoute("www.en.example.com", cd)
+	d, up = h.resolveRoute("www.en.example.com", cd, true)
 	if !d.Matched || d.ListName != "国外" || up[0] != "udp://8.8.8.8:53" {
 		t.Fatalf("命中引用分流应复用其 DNS：%+v / %v", d, up)
 	}
 
 	// 引用分流全部未命中 → 走兜底 DNS，并携带分组配置的偏好与 ECS 语义
-	d, up = h.resolveRoute("www.other.org", cd)
+	d, up = h.resolveRoute("www.other.org", cd, true)
 	if len(up) != 1 || up[0] != "udp://10.0.0.1:53" {
 		t.Fatalf("引用未命中应走兜底 DNS，得到 %v", up)
 	}
@@ -93,7 +93,7 @@ func TestResolveRouteMatchedGroupEmptyFallbackFallsBack(t *testing.T) {
 	h := newRouteFixture(t, routeCfg(t))
 
 	cd := ClientDecision{Matched: true, Scope: "c:专线", Label: "专线", DNSMode: "failover"}
-	_, up := h.resolveRoute("www.anything.example.org", cd)
+	_, up := h.resolveRoute("www.anything.example.org", cd, true)
 	if len(up) != 1 || up[0] != "udp://9.9.9.9:53" {
 		t.Fatalf("兜底 DNS 为空时应回退全局上游，得到 %v", up)
 	}
@@ -128,24 +128,24 @@ func TestResolveRouteMatchedGroupOverrideECS(t *testing.T) {
 	h := newRouteFixture(t, cfg)
 
 	// 明文上游 + 分组 ECS 开启 → 覆写为分组 ECS
-	d, _ := h.resolveRoute("www.plain.example.com", cd)
+	d, _ := h.resolveRoute("www.plain.example.com", cd, true)
 	if !d.Matched || d.ECS.ISPType != "telecom" || d.ECS.Subnet != "59.51.78.211" {
 		t.Fatalf("明文上游 + 分组 ECS 开启应覆写为分组 ECS (telecom)，得到 %+v", d.ECS)
 	}
 
 	// 加密上游 + 分组 ECS 开启 → 同样覆写
-	d2, _ := h.resolveRoute("www.tls.example.com", cd)
+	d2, _ := h.resolveRoute("www.tls.example.com", cd, true)
 	if !d2.Matched || d2.ECS.ISPType != "telecom" {
 		t.Fatalf("加密上游 + 分组 ECS 开启应覆写为分组 ECS (telecom)，得到 %+v", d2.ECS)
 	}
 
 	// 分组未开 ECS → 明文/加密都保留列表自带 ECS
 	cd.ECS = config.ECSPolicy{Enabled: false}
-	d3, _ := h.resolveRoute("www.plain.example.com", cd)
+	d3, _ := h.resolveRoute("www.plain.example.com", cd, true)
 	if !d3.Matched || d3.ECS.ISPType != "unicom" {
 		t.Fatalf("分组未开 ECS 时应保留列表 ECS (unicom)，得到 %+v", d3.ECS)
 	}
-	d4, _ := h.resolveRoute("www.tls.example.com", cd)
+	d4, _ := h.resolveRoute("www.tls.example.com", cd, true)
 	if !d4.Matched || d4.ECS.ISPType != "unicom" {
 		t.Fatalf("分组未开 ECS 时加密上游也应保留列表 ECS (unicom)，得到 %+v", d4.ECS)
 	}
@@ -186,7 +186,7 @@ func TestResolveRouteFallbackEnablesCloudCheck(t *testing.T) {
 		SplitRefs:   []string{"国内"},
 	}
 
-	d, _ := h.resolveRoute("www.other.org", cd) // 命中分组但引用分流未命中 → 兜底
+	d, _ := h.resolveRoute("www.other.org", cd, true) // 命中分组但引用分流未命中 → 兜底
 	if !d.Matched || !d.EnableCloudCheck {
 		t.Fatalf("分组兜底路径应执行云检测，得到 %+v", d)
 	}

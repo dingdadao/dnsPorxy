@@ -16,28 +16,31 @@ func TestCapacity_NoBudget(t *testing.T) {
 	}
 }
 
-// TestCapacity_Adaptive 启用预算后容量应由预算/平均条目大小决定
+// TestCapacity_Adaptive 启用预算后容量应由预算/平均条目大小决定（hardMax=0 表示不设条数上限）
 func TestCapacity_Adaptive(t *testing.T) {
-	c := NewOptimizedDNSCache(5000, 5*time.Minute)
+	c := NewOptimizedDNSCache(0, 5*time.Minute)
 
 	// 先塞一些真实条目，让平均大小有意义
 	for i := 0; i < 50; i++ {
-		c.Set("-", "fill"+itoa(uint32(i))+".example", dns.TypeA,
-			makeAResp("fill"+itoa(uint32(i))+".example", 300), false)
+		name := "fill" + itoa(uint32(i)) + ".example"
+		c.Set("-", name, dns.TypeA, makeAResp(name, 300), false)
 	}
 
-	// 给一个 8MB 预算 —— 单个 A 记录响应很小（百来字节），容量应远超 hardMax
+	// 8MB 预算，单个 A 记录响应约 100~400 字节，容量应远超旧默认的 5000
 	c.SetMemoryBudget(8 << 20)
 	got := c.capacity()
-
-	// 取 min(hardMax=5000, 预算反推值)，所以最大就是 5000
-	if got > 5000 {
-		t.Fatalf("容量不该超过 hardMax=5000，实际 %d", got)
+	if got <= 5000 {
+		t.Fatalf("预算自适应没有放大容量：%d（应远大于 5000）", got)
 	}
 	if got < minDynamicCapacity {
 		t.Fatalf("容量不该低于下限 %d，实际 %d", minDynamicCapacity, got)
 	}
-	t.Logf("8MB 预算下生效容量 = %d", got)
+
+	// 预算调到很小，容量应随之收缩
+	c.SetMemoryBudget(64 << 10)
+	if small := c.capacity(); small >= got {
+		t.Fatalf("预算变小后容量应下降：%d -> %d", got, small)
+	}
 }
 
 // TestCapacity_SmallBudget 预算很小时也应保留下限容量

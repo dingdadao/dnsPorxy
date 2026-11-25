@@ -25,11 +25,19 @@ func effectiveIPPrefer(global string, d SplitDecision) string {
 //   - prefer_aaaa / 不干预：不抑制（查A与查AAAA都照常解析）
 //
 // 返回 true 表示已写出空 NODATA 响应，调用方应立即返回。
+//
+// filterAAAA 为兼容调用（测试与旧路径）：自行解析路由后交给 filterAAAAWithRoute。
 func (h *RefactoredHandler) filterAAAA(w dns.ResponseWriter, req *dns.Msg, domain string, qtype uint16, scope string) bool {
+	return h.filterAAAAWithRoute(w, req, domain, qtype, h.buildRoute(w, domain, scope))
+}
+
+// filterAAAAWithRoute 用已解析好的路由做偏好判定：decision 与 cacheScope 与主查询完全一致
+// （分组 ECS 覆写、ECS 自动分区都包含在内），避免 A 记录判定读到别的线路/网段的缓存。
+func (h *RefactoredHandler) filterAAAAWithRoute(w dns.ResponseWriter, req *dns.Msg, domain string, qtype uint16, route queryRoute) bool {
 	if qtype != dns.TypeAAAA {
 		return false // 查A的请求永不被本策略影响，也不会因此触发任何额外查询
 	}
-	d := h.matcherHandler.MatchDomain(domain)
+	d := route.decision
 	prefer := effectiveIPPrefer(h.getConfig().IPPrefer, d)
 	if prefer != config.IPPreferOnlyA && prefer != config.IPPreferA {
 		return false
@@ -39,8 +47,7 @@ func (h *RefactoredHandler) filterAAAA(w dns.ResponseWriter, req *dns.Msg, domai
 	lookupDNS := ""
 	reason := "只能A：AAAA 一律置空"
 	if prefer == config.IPPreferA {
-		filterClientIP, _ := h.ResolveClientIP(w)
-		hasA, server := h.hasARecord(domain, d, scope, filterClientIP)
+		hasA, server := h.hasARecord(domain, d, route.cacheScope, route.clientIP)
 		if !hasA {
 			return false // 无 A 记录（纯 v6 域名）：放行，照常返回上游 AAAA
 		}
@@ -82,14 +89,16 @@ func (h *RefactoredHandler) filterAAAA(w dns.ResponseWriter, req *dns.Msg, domai
 
 // hasARecord 判断域名是否存在 A 记录：先读缓存，未命中才补查一次 A
 // 补查复用分流路由（上游、解析模式、ECS），结果由缓存层缓存，后续 AAAA 查询不再重复回源
-func (h *RefactoredHandler) hasARecord(domain string, d SplitDecision, scope string, clientIP netip.Addr) (bool, string) {
-	if resp, hit, _, _ := h.cacheManager.GetScoped(scope, domain, dns.TypeA); hit {
+// hasARecord 判断域名是否存在 A 记录：先读缓存，未命中才补查一次 A。
+// cacheScope 由调用方按 ECS 自动模式分区后传入（与主查询共用同一份作用域）。
+func (h *RefactoredHandler) hasARecord(domain string, d SplitDecision, cacheScope string, clientIP netip.Addr) (bool, string) {
+	if resp, hit, _, _ := h.cacheManager.GetScoped(cacheScope, domain, dns.TypeA); hit {
 		return hasIPv4Answer(resp), ""
 	}
 
 	req := &dns.Msg{}
 	req.SetQuestion(dns.Fqdn(domain), dns.TypeA)
-	resp, server, err := h.proxyQueryWithCaching(applySplitECS(req, d, clientIP), h.upstreamsFor(domain, d), domain, dns.TypeA, d.DNSMode, scope, d.QueryTimeout)
+	resp, server, err := h.proxyQueryWithCaching(applySplitECS(req, d, clientIP), h.upstreamsFor(domain, d), domain, dns.TypeA, d.DNSMode, cacheScope, d.QueryTimeout)
 	if err != nil {
 		h.Logger.Debug("⚠️ [A/AAAA 偏好判定补查 A 失败，放行 AAAA] ", map[string]interface{}{
 			"rule":   "IP_PREFER_LOOKUP_A_FAILED",

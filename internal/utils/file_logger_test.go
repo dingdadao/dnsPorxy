@@ -19,11 +19,11 @@ func TestFileLoggerCleanupOldLogs(t *testing.T) {
 	today := time.Now().Format("2006-01-02")
 	oldDay := time.Now().AddDate(0, 0, -10).Format("2006-01-02")
 	files := map[string]bool{
-		"dns-proxy-" + today + ".log":   true, // 当天文件
-		"dns-proxy-" + oldDay + ".log":  true, // 10 天前 → 应删除
-		"dns-proxy-2026-10-01.log":      true, // 过期 → 应删除
-		"dns-proxy-notadate.log":        true, // 非标准命名 → 保留
-		"other-file.txt":                true, // 非 dns-proxy 前缀 → 保留
+		"dns-proxy-" + today + ".log":  true, // 当天文件
+		"dns-proxy-" + oldDay + ".log": true, // 10 天前 → 应删除
+		"dns-proxy-2026-10-01.log":     true, // 过期 → 应删除
+		"dns-proxy-notadate.log":       true, // 非标准命名 → 保留
+		"other-file.txt":               true, // 非 dns-proxy 前缀 → 保留
 	}
 	for name := range files {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0644); err != nil {

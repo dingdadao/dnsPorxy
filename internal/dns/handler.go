@@ -554,6 +554,32 @@ func splitListsRoutingChanged(old, cur []config.SplitList) bool {
 }
 
 // ServeDNS 实现dns.Handler接口（带panic恢复与协议守卫）
+// queryRoute 一次查询的分流结果与缓存作用域。
+// 由 ServeDNS 统一解析后传给各处理分支，避免「缓存作用域」与「实际回源路由」两处
+// 各自 resolveRoute 出现分叉（ECS 自动模式的缓存分区依赖两者完全一致）。
+type queryRoute struct {
+	scope          string         // 客户端线路 scope（日志/统计用）
+	decision       SplitDecision  // 分流决策（含列表级 ECS/预算/偏好）
+	clientDecision ClientDecision // 客户端分组决策（云替换覆写等需要）
+	clientIP       netip.Addr     // 还原出的真实客户端地址
+	cacheScope     string         // 缓存作用域：ECS 自动模式下再叠加推导前缀
+}
+
+// buildRoute 解析一次查询的分流结果与缓存作用域
+func (h *RefactoredHandler) buildRoute(w dns.ResponseWriter, domain, scope string) queryRoute {
+	clientDecision := h.clientDecisionFromScope(scope)
+	// verbose=false：缓存命中路径也要走这里算缓存作用域，不能每条命中都打一次路由日志
+	decision, _ := h.resolveRoute(domain, clientDecision, false)
+	clientIP, _ := h.ResolveClientIP(w)
+	return queryRoute{
+		scope:          scope,
+		decision:       decision,
+		clientDecision: clientDecision,
+		clientIP:       clientIP,
+		cacheScope:     cacheScopeFor(scope, decision, clientIP),
+	}
+}
+
 func (h *RefactoredHandler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 	// panic恢复机制
 	defer func() {
@@ -671,9 +697,13 @@ func (h *RefactoredHandler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 		return
 	}
 
+	// 分流决策与缓存作用域统一解析：ECS 自动模式按客户端网段分区缓存，
+	// 四条处理路径（RD=0 / A-AAAA 偏好 / 普通 / 非IP）必须用同一个 cacheScope。
+	route := h.buildRoute(w, domain, scope)
+
 	// 协议守卫：RD=0的非递归请求仅用缓存回答，缓存未命中回REFUSED
 	if !req.RecursionDesired {
-		if s, ok := h.cacheManager.GetServeScoped(scope, domain, q.Qtype); ok {
+		if s, ok := h.cacheManager.GetServeScoped(route.cacheScope, domain, q.Qtype); ok {
 			h.serveCacheHit(w, req, s)
 			h.recordQuery(w, querylog.Entry{
 				Domain: domain, QType: dns.TypeToString[q.Qtype],
@@ -682,7 +712,7 @@ func (h *RefactoredHandler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 			})
 			return
 		}
-		resp, hit, _, _ := h.cacheManager.GetScoped(scope, domain, q.Qtype)
+		resp, hit, _, _ := h.cacheManager.GetScoped(route.cacheScope, domain, q.Qtype)
 		if !hit {
 			h.sendErrorResponse(w, req, dns.RcodeRefused)
 			h.recordQuery(w, querylog.Entry{
@@ -692,7 +722,7 @@ func (h *RefactoredHandler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 			})
 			return
 		}
-		h.writeResponse(w, req, resp)
+		h.writeCachedResponse(w, req, resp)
 		h.recordQuery(w, querylog.Entry{
 			Domain: domain, QType: dns.TypeToString[q.Qtype],
 			Action: querylog.ActionCache, Rcode: dns.RcodeToString[resp.Rcode],
@@ -703,7 +733,8 @@ func (h *RefactoredHandler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 
 	// A/AAAA 偏好档位：本地篡改优先级最高（已在上面处理），此处先于缓存判定，
 	// 使「只A/优先A」能压过缓存里的 AAAA；RD=0 的「缓存或REFUSED」约束保持在前，不被本策略改写
-	if h.filterAAAA(w, req, domain, q.Qtype, scope) {
+	// 复用上面已解析的 route：偏好判定与补查 A 记录的缓存作用域必须和主查询一致
+	if h.filterAAAAWithRoute(w, req, domain, q.Qtype, route) {
 		return
 	}
 
@@ -711,21 +742,29 @@ func (h *RefactoredHandler) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 	// 其他记录类型（如NS、MX等）也会被处理，但不经过云服务检测优化
 	if q.Qtype != dns.TypeA && q.Qtype != dns.TypeAAAA {
 		// 对于非A/AAAA记录，仍然进行查询，但跳过云服务检测和替换逻辑
-		h.processNonIPQuery(w, req, domain, q.Qtype, scope)
+		h.processNonIPQueryWithRoute(w, req, domain, q.Qtype, route)
 		return
 	}
 
-	h.processQuery(w, req, domain, q.Qtype, scope)
+	h.processQueryWithRoute(w, req, domain, q.Qtype, route)
 }
 
-// processNonIPQuery 处理非IP记录类型的DNS查询（如NS、MX、TXT等）
+// processNonIPQuery 处理非IP记录类型的DNS查询（兼容旧调用：自行解析路由）
 func (h *RefactoredHandler) processNonIPQuery(w dns.ResponseWriter, req *dns.Msg, domain string, qtype uint16, scope string) {
+	h.processNonIPQueryWithRoute(w, req, domain, qtype, h.buildRoute(w, domain, scope))
+}
+
+// processNonIPQueryWithRoute 处理非IP记录类型（如NS、MX、TXT等）。
+// 与 A/AAAA 路径保持一致：命中分流列表时同样按列表 ECS 策略处理请求副本，
+// 缓存读写使用 route.cacheScope（ECS 自动模式据此按客户端网段分区）。
+func (h *RefactoredHandler) processNonIPQueryWithRoute(w dns.ResponseWriter, req *dns.Msg, domain string, qtype uint16, route queryRoute) {
 	start := time.Now()
 
-	clientDecision := h.clientDecisionFromScope(scope)
+	decision := route.decision
+	cacheScope := route.cacheScope
 
 	// 1. 检查缓存（快路径直接打补丁写出预打包字节；不适用时回退到深拷贝路径）
-	if s, ok := h.cacheManager.GetServeScoped(scope, domain, qtype); ok {
+	if s, ok := h.cacheManager.GetServeScoped(cacheScope, domain, qtype); ok {
 		h.serveCacheHit(w, req, s)
 		h.Logger.Debug("✅ [DNS查询完成-非IP记录-缓存命中] ", map[string]interface{}{
 			"domain":      domain,
@@ -740,9 +779,9 @@ func (h *RefactoredHandler) processNonIPQuery(w dns.ResponseWriter, req *dns.Msg
 		})
 		return
 	}
-	resp, hit, _, _ := h.cacheManager.GetScoped(scope, domain, qtype)
+	resp, hit, _, _ := h.cacheManager.GetScoped(cacheScope, domain, qtype)
 	if hit {
-		h.writeResponse(w, req, resp)
+		h.writeCachedResponse(w, req, resp)
 		h.Logger.Debug("✅ [DNS查询完成-非IP记录-缓存命中] ", map[string]interface{}{
 			"domain":      domain,
 			"qtype":       dns.TypeToString[qtype],
@@ -757,11 +796,16 @@ func (h *RefactoredHandler) processNonIPQuery(w dns.ResponseWriter, req *dns.Msg
 		return
 	}
 
-	// 2. 分流决策：客户端分组内引用规则优先，未命中走分组默认上游，再回退全局
-	decision, upstreams := h.resolveRoute(domain, clientDecision)
-
-	// 3. 执行查询（不经过云服务检测和替换逻辑）
-	resp, server, err := h.queryWithFallback(req, upstreams, decision.DNSMode, decision.QueryTimeout)
+	// 2. 执行查询（不经过云服务检测和替换逻辑）；命中分流列表时按列表 ECS 策略处理副本
+	upstreams := h.upstreamsFor(domain, decision)
+	h.Logger.Debug("🎯 [路由决策] ", map[string]interface{}{
+		"domain":      domain,
+		"list":        decision.ListName,
+		"group":       route.clientDecision.Label,
+		"dns_servers": upstreams,
+		"dns_mode":    decision.DNSMode,
+	})
+	resp, server, err := h.queryWithFallback(applySplitECS(req, decision, route.clientIP), upstreams, decision.DNSMode, decision.QueryTimeout)
 	if err != nil || resp == nil {
 		h.Logger.Error("❌ [非IP记录查询失败] ", map[string]interface{}{
 			"domain":      domain,
@@ -798,7 +842,7 @@ func (h *RefactoredHandler) processNonIPQuery(w dns.ResponseWriter, req *dns.Msg
 	}
 
 	// 5. 缓存并原样返回上游响应（不重建owner、不裁剪RRset）
-	h.cacheManager.SetScoped(scope, domain, qtype, resp, false)
+	h.cacheManager.SetScoped(cacheScope, domain, qtype, resp, false)
 	h.writeResponse(w, req, resp)
 
 	h.Logger.Debug("✅ [DNS查询完成-非IP记录] ", map[string]interface{}{
@@ -820,19 +864,29 @@ func (h *RefactoredHandler) processNonIPQuery(w dns.ResponseWriter, req *dns.Msg
 	})
 }
 
-// processQuery 处理单个DNS查询
+// processQuery 处理单个DNS查询（兼容旧调用：自行解析路由后交给 processQueryWithRoute）
 func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, domain string, qtype uint16, scope string) {
+	h.processQueryWithRoute(w, req, domain, qtype, h.buildRoute(w, domain, scope))
+}
+
+// processQueryWithRoute 用已解析好的路由与缓存作用域处理 A/AAAA 查询。
+// route.cacheScope 在 ECS 自动模式下已按客户端推导前缀分区，缓存读写与回源必须一致使用它。
+func (h *RefactoredHandler) processQueryWithRoute(w dns.ResponseWriter, req *dns.Msg, domain string, qtype uint16, route queryRoute) {
+	scope := route.scope
+	clientDecision := route.clientDecision
+	decision := route.decision
+	clientIP := route.clientIP
+	cacheScope := route.cacheScope
+
 	// 开始计时整个处理过程
 	totalTimer := h.Logger.StartTimer("total_dns_request")
 	defer totalTimer.End()
 
-	clientDecision := h.clientDecisionFromScope(scope)
-
 	// 1. 缓存检查（使用单飞行模式避免重复查询）
 	//    快路径：域名未被标记为云服务时，直接打补丁写出预打包字节，省掉每次命中的整包深拷贝。
 	//    被任何常见类型标记为云时交回原路径（保证「域名带云标记时优先云响应」的原有语义）。
-	if s, ok := h.cacheManager.GetServeScoped(scope, domain, qtype); ok {
-		if !h.cacheManager.IsDomainCloudScoped(scope, domain) {
+	if s, ok := h.cacheManager.GetServeScoped(cacheScope, domain, qtype); ok {
+		if !h.cacheManager.IsDomainCloudScoped(cacheScope, domain) {
 			h.serveCacheHit(w, req, s)
 			totalTime := totalTimer.End()
 			h.Logger.Debug("✅ [DNS查询完成-缓存命中] ", map[string]interface{}{
@@ -850,13 +904,13 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 			return
 		}
 	}
-	resp, hit, _, _ := h.cacheManager.GetWithFlightScoped(scope, domain, qtype)
+	resp, hit, _, _ := h.cacheManager.GetWithFlightScoped(cacheScope, domain, qtype)
 	if hit {
 		// 检查域名级别的云服务状态，确保A/AAAA记录处理一致性
-		if h.cacheManager.IsDomainCloudScoped(scope, domain) {
+		if h.cacheManager.IsDomainCloudScoped(cacheScope, domain) {
 			// 云域名：返回云替换响应缓存
-			if cloudResp, cloudHit, _ := h.cacheManager.GetCloudResponseScoped(scope, domain, qtype); cloudHit {
-				h.writeResponse(w, req, cloudResp)
+			if cloudResp, cloudHit, _ := h.cacheManager.GetCloudResponseScoped(cacheScope, domain, qtype); cloudHit {
+				h.writeCachedResponse(w, req, cloudResp)
 				totalTime := totalTimer.End()
 				h.Logger.Debug("✅ [DNS查询完成-缓存命中-云域名] ", map[string]interface{}{
 					"domain":      domain,
@@ -873,8 +927,8 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 				return
 			}
 		} else {
-			// 普通域名缓存命中：resp已是递减TTL后的副本
-			h.writeResponse(w, req, resp)
+			// 普通域名缓存命中：resp已是递减TTL后的副本，出口只压上限、不再抬下限
+			h.writeCachedResponse(w, req, resp)
 			totalTime := totalTimer.End()
 			h.Logger.Debug("✅ [DNS查询完成-缓存命中] ", map[string]interface{}{
 				"domain":      domain,
@@ -892,11 +946,7 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 		}
 	}
 
-	// 2. 分流决策：客户端分组内引用规则优先，未命中走分组默认上游，再回退全局
-	decision, upstreams := h.resolveRoute(domain, clientDecision)
-
-	// 客户端真实地址：ECS 注入（Auto 模式）与解析日志的 ECS 摘要共用，只解析一次
-	clientIP, _ := h.ResolveClientIP(w)
+	// 2. 分流决策已在上方提前解析（缓存需要按 ECS 推导前缀分区），这里只做日志摘要
 	ecs := ecsSummaryFor(req, decision, clientIP)
 
 	// 总超时预算的截止时间：主查询与后续云替换回源共用同一份预算，
@@ -906,12 +956,23 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 		budgetDeadline = time.Now().Add(decision.QueryTimeout)
 	}
 
+	// 回源前才解析上游（缓存命中路径不需要），并只在这一处打印路由决策
+	upstreams := h.upstreamsFor(domain, decision)
+	h.Logger.Debug("🎯 [路由决策] ", map[string]interface{}{
+		"domain":       domain,
+		"list":         decision.ListName,
+		"group":        clientDecision.Label,
+		"dns_servers":  upstreams,
+		"dns_mode":     decision.DNSMode,
+		"query_budget": decision.QueryTimeout.String(),
+	})
+
 	// 计时上游查询
 	upstreamTimer := h.Logger.StartTimer("upstream_query")
 
 	// 3. 代理查询上游DNS服务器（按列表解析模式：竞速 / 串行故障转移；全部失败回退 BackupDNS）
 	//    命中分流列表时按列表 ECS 策略处理请求副本（剥离客户端 ECS / 注入本地 ECS）
-	resp, server, err := h.proxyQueryWithCaching(applySplitECS(req, decision, clientIP), upstreams, domain, qtype, decision.DNSMode, scope, decision.QueryTimeout)
+	resp, server, err := h.proxyQueryWithCaching(applySplitECS(req, decision, clientIP), upstreams, domain, qtype, decision.DNSMode, cacheScope, decision.QueryTimeout)
 	upstreamTime := upstreamTimer.End()
 
 	if err != nil || resp == nil {
@@ -944,7 +1005,7 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 			"list":   decision.ListName,
 		})
 	} else if !h.cloudDetector.IsReplaceDomain(domain) {
-		chainIPs := h.cnameProcessor.CollectChainIPs(resp, domain, qtype, scope)
+		chainIPs := h.cnameProcessor.CollectChainIPs(resp, domain, qtype, cacheScope)
 		if len(chainIPs) > 0 {
 			probe := &dns.Msg{Answer: chainIPs}
 			if h.getConfig().EnableCloudflareCheck {
@@ -982,7 +1043,7 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 		finalResp, _ := h.cloudHandler.HandleCloudReplacement(w, req, domain, qtype, int(detection.Type), resp,
 			effectiveIPPrefer(h.getConfig().IPPrefer, decision),
 			rc, ReplaceContext{
-				Scope:     scope,
+				Scope:     cacheScope,
 				Route:     decision,
 				Upstreams: upstreams,
 				DNSMode:   decision.DNSMode,
@@ -1012,7 +1073,7 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 	h.writeResponse(w, req, resp)
 
 	// 检查域名是否命中分流列表
-	isDomainCloud := h.cacheManager.IsDomainCloudScoped(scope, domain)
+	isDomainCloud := h.cacheManager.IsDomainCloudScoped(cacheScope, domain)
 
 	var logSource string
 	if isDomainCloud {
@@ -1047,7 +1108,21 @@ func (h *RefactoredHandler) processQuery(w dns.ResponseWriter, req *dns.Msg, dom
 
 // writeResponse 统一响应出口：所有路径（缓存命中/上游/云替换/错误）唯一WriteMsg的地方
 // 统一处理：回写原始Question（保留客户端QNAME大小写）、清除AD位、回带EDNS OPT、UDP截断（TC位）
+//
+// TTL 钳制在这里施加完整规则（min+max）：未命中的响应直接来自上游对象，缓存副本已被钳制，
+// 出口再施加一次才能保证「首次未命中」与「后续命中」返回一致的 TTL。
 func (h *RefactoredHandler) writeResponse(w dns.ResponseWriter, req *dns.Msg, resp *dns.Msg) {
+	h.writeResponseTTL(w, req, resp, true)
+}
+
+// writeCachedResponse 缓存命中专用的响应出口：TTL 已按缓存时长递减，出口只压上限（max_ttl），
+// 不再把 min_ttl 施加回去——否则客户端会把记录缓存得比服务端条目更久，与 wire 快路径也不一致。
+func (h *RefactoredHandler) writeCachedResponse(w dns.ResponseWriter, req *dns.Msg, resp *dns.Msg) {
+	h.writeResponseTTL(w, req, resp, false)
+}
+
+// writeResponseTTL writeResponse/writeCachedResponse 的公共实现；applyMin=false 时只压上限。
+func (h *RefactoredHandler) writeResponseTTL(w dns.ResponseWriter, req *dns.Msg, resp *dns.Msg, applyMin bool) {
 	if resp == nil {
 		return
 	}
@@ -1076,8 +1151,13 @@ func (h *RefactoredHandler) writeResponse(w dns.ResponseWriter, req *dns.Msg, re
 	// TTL 钳制：缓存命中走 wire 快路径时 TTL 已在写入缓存时钳制，
 	// 但首次未命中的响应直接来自上游对象，必须在这里再施加一次，
 	// 否则同一域名首次查询与后续查询会返回不同 TTL。
+	// 缓存命中路径（writeCachedResponse）只压上限：命中的 TTL 已经按缓存时长递减过。
 	if h.cacheManager != nil {
-		h.cacheManager.ApplyTTLBounds(resp)
+		if applyMin {
+			h.cacheManager.ApplyTTLBounds(resp)
+		} else {
+			h.cacheManager.ApplyTTLUpperBound(resp)
+		}
 	}
 
 	// UDP截断：超过客户端通告payload size（无EDNS时为512）时设置TC=1，让客户端转TCP重试
@@ -1110,7 +1190,8 @@ func (h *RefactoredHandler) serveCacheHit(w dns.ResponseWriter, req *dns.Msg, s 
 		return
 	}
 	decrementTTLs(msg, time.Since(s.StoredAt))
-	h.writeResponse(w, req, msg)
+	// 命中出口：TTL 已按缓存时长递减，不能再被 min_ttl 抬回去
+	h.writeCachedResponse(w, req, msg)
 }
 
 // writeResponseWire 用缓存里的预打包字节直写响应：只改写 ID、AD位、Question 大小写与各 RR 的 TTL，
@@ -1303,13 +1384,10 @@ func (h *RefactoredHandler) refreshDNSRecord(domain string, qtype uint16) error 
 }
 
 // upstreamsFor 由分流决策得出上游DNS服务器（未命中分流列表时回退全局上游）
+// upstreamsFor 返回该决策实际使用的上游集合（纯计算，不做日志：
+// 缓存命中路径也会解析路由，逐条命中打日志会把日志量翻倍）。
 func (h *RefactoredHandler) upstreamsFor(domain string, d SplitDecision) []string {
 	if d.Matched {
-		h.Logger.Debug("🎯 命中分流列表", map[string]interface{}{
-			"domain":      domain,
-			"list":        d.ListName,
-			"dns_servers": d.DNS,
-		})
 		return d.DNS
 	}
 	return h.getConfig().Upstream
@@ -1360,7 +1438,7 @@ func (h *RefactoredHandler) effectiveQueryTimeout(scoped time.Duration) time.Dur
 	return h.getConfig().QueryTimeout
 }
 
-func (h *RefactoredHandler) resolveRoute(domain string, cd ClientDecision) (SplitDecision, []string) {
+func (h *RefactoredHandler) resolveRoute(domain string, cd ClientDecision, verbose bool) (SplitDecision, []string) {
 	if !cd.Matched {
 		d := h.matcherHandler.MatchDomain(domain)
 		// 域名分流全部未命中（d.DNSMode 为空）：套用全局默认解析模式（race/failover/wrandom）。
@@ -1382,13 +1460,15 @@ func (h *RefactoredHandler) resolveRoute(domain string, cd ClientDecision) (Spli
 			}
 			// 列表自身没配总超时，则沿用引用它的分组配置，再退到全局
 			d.QueryTimeout = h.effectiveQueryTimeout(firstPositive(d.QueryTimeout, cd.QueryTimeout))
-			h.Logger.Debug("🎯 [客户端分组命中，复用引用分流] ", map[string]interface{}{
-				"rule":   "CLIENT_GROUP_SUBDIVERT",
-				"group":  cd.Label,
-				"scope":  cd.Scope,
-				"domain": domain,
-				"list":   d.ListName,
-			})
+			if verbose {
+				h.Logger.Debug("🎯 [客户端分组命中，复用引用分流] ", map[string]interface{}{
+					"rule":   "CLIENT_GROUP_SUBDIVERT",
+					"group":  cd.Label,
+					"scope":  cd.Scope,
+					"domain": domain,
+					"list":   d.ListName,
+				})
+			}
 			return d, d.DNS
 		}
 	}
@@ -1410,13 +1490,15 @@ func (h *RefactoredHandler) resolveRoute(domain string, cd ClientDecision) (Spli
 		IPPrefer:         cd.IPPrefer,
 		ECS:              cd.ECS,
 	}
-	h.Logger.Debug("🎯 [客户端分组命中，分流未命中走兜底 DNS] ", map[string]interface{}{
-		"rule":   "CLIENT_GROUP_FALLBACK",
-		"group":  cd.Label,
-		"scope":  cd.Scope,
-		"domain": domain,
-		"dns":    upstreams,
-	})
+	if verbose {
+		h.Logger.Debug("🎯 [客户端分组命中，分流未命中走兜底 DNS] ", map[string]interface{}{
+			"rule":   "CLIENT_GROUP_FALLBACK",
+			"group":  cd.Label,
+			"scope":  cd.Scope,
+			"domain": domain,
+			"dns":    upstreams,
+		})
+	}
 	return d, upstreams
 }
 

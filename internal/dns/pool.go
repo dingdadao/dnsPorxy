@@ -629,6 +629,7 @@ func (p *UDPConnPool) GetClient(addr string, timeout time.Duration) *dns.Client 
 		DialTimeout:    timeout,
 		ReadTimeout:    timeout,
 		WriteTimeout:   timeout,
+		UDPSize:        4096, // 读缓冲覆盖完整响应，避免大报文解包失败被误判为上游不可用
 		SingleInflight: true, // 对于相同的查询只允许一次飞行中的请求
 	}
 
