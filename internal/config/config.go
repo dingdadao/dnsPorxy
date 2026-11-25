@@ -46,6 +46,24 @@ type ECSPolicy struct {
 	Auto    bool   // 自动模式：忽略 Subnet，按本次查询的真实客户端 IP 推导前缀（内网源不注入）
 }
 
+// validateECSPolicy 校验 ECS 策略：
+//   - 手动模式（auto=false）：必须给出受支持的线路类型与公网 IP/CIDR，否则运行时静默不注入，
+//     这种「配了 ECS 但没生效」最难排查，必须在保存时就拦下；
+//   - 自动模式（auto=true）：前缀来自本次查询的真实客户端 IP，subnet/isp_type 均被忽略，
+//     留空是正常用法，不做必填校验。
+func validateECSPolicy(prefix string, ecs ECSPolicy) error {
+	if !ecs.Enabled || ecs.Auto {
+		return nil
+	}
+	if !ValidECSType(ecs.ISPType) {
+		return fmt.Errorf("%s.ecs.isp_type: 非法取值 %q（可选 telecom/unicom/mobile；自动模式 auto=true 时无需填写）", prefix, ecs.ISPType)
+	}
+	if strings.TrimSpace(ecs.Subnet) == "" {
+		return fmt.Errorf("%s.ecs.subnet: 启用 ECS 注入时必须填写公网 IP 或 CIDR（自动模式 auto=true 时无需填写）", prefix)
+	}
+	return nil
+}
+
 // ECSPrefixLen 返回按客户端地址推导 ECS 前缀时使用的掩码长度（RFC 7871 建议值）
 func ECSPrefixLen(ip netip.Addr) int {
 	if ip.Is6() {
@@ -393,7 +411,7 @@ func DefaultConfig() *Config {
 		CloudflareNetFile6:     "./data/cf_mrs_file6.txt",
 		AWSNetFile:             "./data/aws.txt",
 		NetworkRefreshInterval: 96 * time.Hour,
-		LogLevel:               "debug",
+		LogLevel:               DefaultLogLevel, // 默认 info：debug 只在排障时显式开启（每条查询会产生 6~10 行调试日志）
 		LogFormat:              "text",
 		Cache: CacheConfig{
 			MaxItems:        0, // 0 = 不设条数硬上限，容量由 MemoryBudget 自适应决定
@@ -491,6 +509,9 @@ func ValidateConfig(cfg *Config) error {
 			return err
 		}
 		if err := validateQueryTimeout(fmt.Sprintf("split_lists[%d].query_timeout", i), cfg.SplitLists[i].QueryTimeout); err != nil {
+			return err
+		}
+		if err := validateECSPolicy(fmt.Sprintf("split_lists[%d]", i), cfg.SplitLists[i].ECS); err != nil {
 			return err
 		}
 	}
@@ -640,11 +661,8 @@ func ValidateConfig(cfg *Config) error {
 		if !ValidIPPrefer(ipPrefer) {
 			return fmt.Errorf("%s.ip_prefer: 非法取值 %q", prefix, ipPrefer)
 		}
-		if ecs.Enabled && !ValidECSType(ecs.ISPType) {
-			return fmt.Errorf("%s.ecs.isp_type: 非法取值 %q", prefix, ecs.ISPType)
-		}
-		if ecs.Enabled && strings.TrimSpace(ecs.Subnet) == "" {
-			return fmt.Errorf("%s.ecs.subnet: 启用 ECS 注入时必须填写公网 IP 或 CIDR", prefix)
+		if err := validateECSPolicy(prefix, ecs); err != nil {
+			return err
 		}
 		return nil
 	}

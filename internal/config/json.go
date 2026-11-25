@@ -228,8 +228,8 @@ type CacheJSON struct {
 	TTL             string `json:"ttl"`
 	StaleTTL        string `json:"stale_ttl"`
 	MaxAsyncWorkers int    `json:"max_async_workers"`
-	MinTTL          string `json:"min_ttl,omitempty"`       // TTL 下限，空/0 表示不启用
-	MaxTTL          string `json:"max_ttl,omitempty"`       // TTL 上限，空/0 表示不启用
+	MinTTL          string `json:"min_ttl,omitempty"`          // TTL 下限，空/0 表示不启用
+	MaxTTL          string `json:"max_ttl,omitempty"`          // TTL 上限，空/0 表示不启用
 	MemoryBudgetMB  int64  `json:"memory_budget_mb,omitempty"` // 缓存内存预算（MB），0 表示不启用自适应
 }
 
